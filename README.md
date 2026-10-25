@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.svg" alt="Principia: an isometric drawing of a legionary headquarters, a colonnaded courtyard with the basilica at the back" width="220"></p>
+
 # Principia
 
 **Your Claude Code dashboard: every instruction in view while the agent works.**

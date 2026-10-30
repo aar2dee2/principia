@@ -14,6 +14,8 @@ Principia keeps those apart:
 - **Statuses that follow the work.** At the end of every turn, Haiku is given every requirement with its status, the edits and tests the agent just ran, and its reply, and moves the requirements that turn affected: *in progress*, *done (not verified)*, *blocked* or *needs you*. The agent can report progress itself too. Only *verified* needs evidence.
 - **Signals.** Tool calls that failed or were refused, and things the agent found that were new or unexpected, in one column so you don't have to dig through the chat. Each keeps its context: the requirement, your message that started the turn, what the agent ran and the first of what came back.
 - **Conflicts.** When a later message contradicts an earlier requirement, or the agent's work goes against one, the requirement is flagged until you resolve it, and the agent is told to ask you which wins. A deliberate change ("actually, drop the search box") usually counts as a refinement instead; the line between the two is a judgment call, so now and then a correction is flagged as a conflict, and `x` settles it.
+- **Footprint.** What each session costs this computer: the memory its processes hold right now, and the files it leaves behind (its transcript, its ledger, a folder of its own if it has one), each with its size, how long it stays, and whether Time Machine has it. `M` in the window.
+- **Verify, nudged.** When a session goes idle with requirements the agent says are done but nothing has checked, Principia asks it, once per requirement, to run the test, build or check that proves each one. `/ledger nudge off` stops that.
 - **Plan, Tests and Preview.** The agent's todo list with each step linked to the requirements it serves (and the ones it leaves out), every test or build run with the requirements it's evidence for, and the dev servers or preview links its commands printed.
 - **Diffs where you read code.** A change opens in Cursor, VS Code or Windsurf, or as a diff in the terminal. No diffs are drawn in the ledger itself.
 
@@ -91,6 +93,10 @@ The same, in a terminal you choose, remembered from then on. Without a name, the
 
 Downloads the `principia` program for your system from this repository's GitHub releases, checks it against the SHA-256 recorded in the plugin (a mismatch is deleted, never run), checks that it starts, and keeps it in `~/.claude/principia/bin`. Needed once per Principia version, for `/ledger window` and `/ledger import`.
 
+### `/ledger nudge on` · `/ledger nudge off`
+
+Whether Principia asks the agent, on its own, to verify requirements it says are done. On by default: when a turn ends and the session stays idle for 20 seconds with such requirements, the agent is asked once per requirement to run the test, build or check that proves it. `g` in the window asks at any time.
+
 ### `/ledger refresh`
 
 Reads this session's **whole** conversation, from the first message: adds any requirement the ledger missed (existing ones keep their ids) and corrects any status that's wrong. Use it if statuses look stale, for example in a session that ran before Principia judged progress on its own. Reads this session's transcript, so it needs your permission (below). A long session takes a minute or two.
@@ -131,6 +137,7 @@ Titled **Principia - Your Claude Code Dashboard**. Sessions are listed by projec
 | `S` | Show or hide the Sessions column, for more room on one session |
 | `C` | Show or hide the Completion audit (the selected item's details stay) |
 | `A` | Activity for the selected requirement only · all activity |
+| `M` | Footprint: each session's memory and files, with how long they stay and whether they're backed up |
 | `1`–`5` | Activity, Plan, Tests, Preview, Signals |
 | `/` · `F` | Search requirements · cycle the filter (open, done but not verified, verified, to revisit, conflicts, yours, the agent's) |
 | `c` or Enter | Comment on the selected event (the agent doesn't see it) · on a signal, go to its event · on a preview, open it |

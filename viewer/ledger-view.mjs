@@ -10,6 +10,7 @@ import { spawn, spawnSync } from 'node:child_process'
 
 import { DEFAULT_THEME, palette } from '../hooks/theme.ts'
 import { REQ_FILTERS, filterReqs, gapOf, isSecretPath, isVerified, linker } from '../hooks/work.ts'
+import { LIFETIME, fmtKb } from '../hooks/footprint.ts'
 
 const G = globalThis.PRINCIPIA ?? { args: process.argv.slice(2), self: [process.execPath, process.argv[1]], isCompiled: false }
 const HOME = os.homedir()
@@ -57,12 +58,12 @@ const savePrefs = () => { try { fs.writeFileSync(PREFS, JSON.stringify(prefs)) }
 const EMPTY = { reqs: [], events: [], replies: [], signals: [], plan: [], previews: [], editors: [], isWorking: false, title: '', project: '' }
 let S = EMPTY
 let focus = 'reqs' // sessions | reqs | signals | middle
-let middle = 'activity' // activity | plan | tests | preview | signals
+let middle = 'activity' // activity | plan | tests | preview | signals | footprint
 let showAll = false
 let allActivity = false // A: every event, not only the requirement in view's
 let search = ''
 let reqFilter = 'all'
-const sel = { reqs: 0, signals: 0, activity: 0, plan: 0, tests: 0, preview: 0 }
+const sel = { reqs: 0, signals: 0, activity: 0, plan: 0, tests: 0, preview: 0, footprint: 0 }
 let compose = null // { mode, text, interrupt, eventId, refines } | { mode: 'search', text }
 let flash = ''
 // Commands are ordered by time across windows: the session keeps only ones newer than the last.
@@ -260,6 +261,35 @@ const shownEvents = () => {
 const testRuns = () => [...S.events].filter(e => e.kind === 'test').reverse()
 const previews = () => [...(S.previews ?? [])].reverse()
 
+// ---------- footprint: memory held, files left ----------
+
+const sizeKb = file => { try { return Math.round(fs.statSync(file).size / 1024) } catch { return 0 } }
+// How long Claude Code keeps transcripts (its cleanupPeriodDays setting; 30 by default), and
+// whether Time Machine has a backup, each checked now and then.
+let keepDays = 30
+let backup = { checked: 0, latest: '' }
+function checkBackup() {
+  try { keepDays = Number(JSON.parse(fs.readFileSync(path.join(path.dirname(dir), 'settings.json'), 'utf8')).cleanupPeriodDays) || 30 } catch { /* default */ }
+  if (process.platform !== 'darwin') return
+  try {
+    const r = spawn('tmutil', ['latestbackup'], { stdio: ['ignore', 'pipe', 'ignore'] })
+    let outText = ''
+    r.stdout.on('data', d => { outText += d })
+    r.on('close', code => { backup = { checked: now(), latest: code === 0 ? outText.trim().split('/').pop() ?? '' : '' } })
+  } catch { backup = { checked: now(), latest: '' } }
+}
+// Every session, with what it costs: live ones report their memory and folder themselves.
+function footList() {
+  return sessionList().map(st => {
+    const f = st.footprint ?? {}
+    const live = isLive(st)
+    const transcriptKb = sizeKb(transcriptOf.get(st.sessionId) ?? '') || f.transcriptKb || 0
+    const ledgerKb = sizeKb(path.join(dir, `state-${st.sessionId}.json`))
+    const workspaceKb = f.workspace ? f.workspaceKb || 0 : 0
+    return { st, live, ramKb: live ? f.ramKb || 0 : 0, procs: live ? f.procs || 0 : 0, transcriptKb, ledgerKb, workspaceKb, workspace: f.workspace, diskKb: transcriptKb + ledgerKb + workspaceKb }
+  }).sort((a, b) => (b.ramKb + b.diskKb) - (a.ramKb + a.diskKb))
+}
+
 function reqLines(w) {
   const reqs = shownReqs()
   const filterLabel = REQ_FILTERS.find(f => f.value === reqFilter)?.label ?? 'All'
@@ -292,7 +322,7 @@ function signalLines(w, heading = true) {
 
 function middleLines(w, withSignals) {
   const tabs = [['activity', `1 Activity ${shownEvents().length}`], ['plan', `2 Plan ${S.plan?.length ?? 0}`], ['tests', `3 Tests ${testRuns().length}`],
-    ['preview', `4 Preview ${S.previews?.length ?? 0}`], ...(withSignals ? [['signals', `5 Signals ${openSignals().length}`]] : [])]
+    ['preview', `4 Preview ${S.previews?.length ?? 0}`], ...(withSignals ? [['signals', `5 Signals ${openSignals().length}`]] : []), ...(middle === 'footprint' ? [['footprint', 'M Footprint']] : [])]
   const lines = [tabs.flatMap(([id, label]) => [seg(` ${label} `, middle === id ? P.text : P.text3, middle === id ? P.surface2 : undefined, middle === id), seg(' ')]), []]
   const isSel = (list, i) => focus === 'middle' && i === sel[list]
   if (middle === 'signals') return [...lines, ...signalLines(w, false)]
@@ -333,6 +363,21 @@ function middleLines(w, withSignals) {
         ...(backs.length ? [seg(` evidence for ${backs.join(', ')}`, P.text3)] : [])] })
       for (const row of wrapText(t.detail ?? t.title, w - 2).slice(0, 2)) lines.push({ sel: isSel('tests', i), line: [seg('  '), seg(row, P.text2)] })
     })
+  } else if (middle === 'footprint') {
+    const list = footList()
+    const ram = list.reduce((n, x) => n + x.ramKb, 0), disk = list.reduce((n, x) => n + x.diskKb, 0)
+    lines.push([seg('Memory ', P.text3), seg(fmtKb(ram), P.text, undefined, true), seg(' · on disk ', P.text3), seg(fmtKb(disk), P.text, undefined, true), seg(' · this computer only', P.text3)])
+    lines.push([])
+    const cw = 9
+    lines.push([seg(' '.repeat(w - cw * 3 - 2)), seg('memory'.padStart(cw), P.text3), seg('on disk'.padStart(cw), P.text3), seg('folder'.padStart(cw), P.text3)])
+    list.forEach((x, i) => {
+      const name = [...`${x.live ? (x.st.isWorking ? '● ' : '○ ') : '· '}${nameOf(x.st)}`].slice(0, w - cw * 3 - 3).join('')
+      lines.push({ sel: isSel('footprint', i), line: [seg(name.padEnd(w - cw * 3 - 2), x.live ? P.text : P.text3),
+        seg((x.live ? fmtKb(x.ramKb) : '–').padStart(cw), x.live ? P.active : P.text3), seg(fmtKb(x.diskKb).padStart(cw), P.text),
+        seg((x.workspace ? fmtKb(x.workspaceKb) : '–').padStart(cw), x.workspace ? P.warn : P.text3)] })
+    })
+    lines.push([], ...wrap(`Transcripts (~/.claude/projects) are ${LIFETIME.transcript(keepDays)}. Ledgers (~/.claude/principia) are ${LIFETIME.ledger}. A folder is the session's own: ${LIFETIME.scratch}, or ${LIFETIME.worktree}.`, w, P.text3))
+    lines.push([], ...wrap(backup.latest ? `Time Machine's last backup: ${backup.latest}. Nothing here is synced anywhere else.` : backup.checked ? 'No Time Machine backup found: these files exist on this computer only.' : 'Checking for a Time Machine backup…', w, backup.latest ? P.text3 : P.warn))
   } else if (middle === 'preview') {
     const list = previews()
     if (!list.length) lines.push(...wrap('No previews yet. Local dev servers and preview links that commands print show here. Enter opens one.', w, P.text3))
@@ -377,6 +422,23 @@ function signalContext(sig, w) {
 function detailLines(w) {
   const lines = []
   const sig = openSignals()[sel.signals]
+  if (focus === 'middle' && middle === 'footprint') {
+    const x = footList()[sel.footprint]
+    if (!x) return lines
+    const f = x.st.footprint ?? {}
+    lines.push(...wrap(nameOf(x.st), w, P.text), [seg(`${projectOf(x.st)} · ${x.live ? (x.st.isWorking ? 'working' : 'idle') : x.st.imported ? 'imported' : 'not running'}`, P.text3)], [])
+    if (x.live) lines.push([seg('Memory now', P.text3)], ...wrap(`${fmtKb(x.ramKb)} across ${x.procs} process${x.procs === 1 ? '' : 'es'}: the session itself and whatever it started (shells, servers, subagents). Freed when the session stops.`, w, P.text2, '  '), [])
+    else lines.push([seg('Memory now', P.text3)], ...wrap('Nothing: the session is not running.', w, P.text2, '  '), [])
+    lines.push([seg('Files it leaves', P.text3)])
+    lines.push(...wrap(`Transcript ${fmtKb(x.transcriptKb)}: ${LIFETIME.transcript(keepDays)}.`, w, P.text2, '  '))
+    if (transcriptOf.get(x.st.sessionId)) lines.push(...wrap(transcriptOf.get(x.st.sessionId).replace(HOME, '~'), w, P.text3, '    '))
+    lines.push(...wrap(`Ledger ${fmtKb(x.ledgerKb)}: ${LIFETIME.ledger}.`, w, P.text2, '  '))
+    if (x.workspace) lines.push(...wrap(`Folder ${fmtKb(x.workspaceKb)}: ${LIFETIME[x.workspace.kind]}.`, w, P.text2, '  '), ...wrap(x.workspace.path.replace(HOME, '~'), w, P.text3, '    '))
+    else lines.push(...wrap('No folder of its own: it works in your project, which is yours to keep.', w, P.text2, '  '))
+    lines.push([], ...wrap(backup.latest ? `Backed up by Time Machine as of ${backup.latest}; not synced anywhere else.` : 'On this computer only: not backed up, not synced.', w, backup.latest ? P.text2 : P.warn))
+    if (f.at) lines.push([], [seg(`measured ${hhmm(f.at)}`, P.text3)])
+    return lines
+  }
   if (focus === 'reqs') {
     const r = shownReqs()[sel.reqs]
     if (r) {
@@ -480,7 +542,7 @@ function render() {
       ...(compose.mode === 'comment' ? [] : [seg('  '), compose.interrupt ? chip('interrupt first', 'danger') : seg('ctrl-t interrupt first', P.text3)]),
       seg('  › ', P.active), seg(compose.text + '▏', P.text)]
   } else {
-    footer = [seg(flash || 'tab column · ↑↓ move · [ ] session · S sessions · C audit · A all activity · / search · F filter · 1-5 tabs · x resolve/dismiss · l light/dark · h headless · q quit', flash ? P.active : P.text3)]
+    footer = [seg(flash || 'tab column · ↑↓ move · [ ] session · S sessions · C audit · A all activity · M footprint · / search · F filter · 1-5 tabs · x resolve/dismiss · l light/dark · h headless · q quit', flash ? P.active : P.text3)]
   }
   rows.push({ line: [] }, { line: [seg('─'.repeat(W), P.border)] }, { line: footer })
   out.write('\x1b[H' + rows.map(r => r.raw ?? paint(r.line, W, P.bg)).join('\r\n') + '\x1b[0m')
@@ -516,7 +578,7 @@ function switchSession(step) {
 }
 
 function clampSel() {
-  const max = { reqs: shownReqs().length, signals: openSignals().length, activity: shownEvents().length, plan: S.plan?.length ?? 0, tests: testRuns().length, preview: previews().length }
+  const max = { reqs: shownReqs().length, signals: openSignals().length, activity: shownEvents().length, plan: S.plan?.length ?? 0, tests: testRuns().length, preview: previews().length, footprint: sessionList().length }
   for (const k of Object.keys(sel)) sel[k] = Math.max(0, Math.min(sel[k], (max[k] ?? 1) - 1))
 }
 
@@ -627,6 +689,7 @@ function onKey(k) {
     case 'S': prefs.showSessions = !prefs.showSessions; savePrefs(); if (focus === 'sessions') focus = 'reqs'; break
     case 'C': prefs.showAudit = !prefs.showAudit; savePrefs(); say(prefs.showAudit ? 'Completion audit shown' : 'Completion audit hidden · C brings it back'); return
     case 'A': allActivity = !allActivity; sel.activity = 0; break
+    case 'M': middle = 'footprint'; focus = 'middle'; checkBackup(); break
     case 'h': prefs.showHeadless = !prefs.showHeadless; savePrefs(); say(prefs.showHeadless ? 'Showing headless (claude -p) sessions' : 'Hiding headless sessions'); return
     case 'l': prefs.dark = !isDark(); savePrefs(); break
     case 'v': showAll = !showAll; sel.activity = 0; break
@@ -702,6 +765,8 @@ setInterval(heartbeat, 1000)
 heartbeat()
 setInterval(scan, 500)
 setInterval(() => { indexTranscripts(); refreshTitles(); render() }, 15_000)
+checkBackup()
+setInterval(checkBackup, 600_000)
 setInterval(render, 5000) // liveness changes with time alone
 
 out.write('\x1b[?1049h\x1b[?25l')

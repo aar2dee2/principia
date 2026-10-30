@@ -23,6 +23,8 @@ import type { Complete, LedgerItem, PastPrompt, Progress, Tagged, Turn } from '.
 import { PLAN_TOOLS, REQ_FILTERS, failureText, filterReqs, gapOf, humanText, isSecretPath, linker, planFrom, previewUrls, trimEvents } from './work'
 import type { ReqFilterName } from './work'
 import { RELEASE } from './release'
+import { FIND_SELF, duKb, fmtKb, treeRss, workspaceOf } from './footprint'
+import type { Footprint } from './footprint'
 import { EDITORS, LINUX, MAC, WINDOWS, base, firstLine, join, launchCommand, programName } from './platform'
 import type { Editor, OS, Platform, Terminal } from './platform'
 import {
@@ -63,6 +65,8 @@ const previewsA = atom({ plugin: 'principia', key: 'previews' } as const, [] as 
 const drawnA = atom({ plugin: 'principia', key: 'drawn' } as const, false)
 // Every turn's message and reply, so statuses can be re-judged against the whole session.
 const turnsA = atom({ plugin: 'principia', key: 'turns' } as const, [] as Turn[])
+// What this session costs the computer: memory held now, files left behind (see footprint.ts).
+const footprintA = atom({ plugin: 'principia', key: 'footprint' } as const, undefined as Footprint | undefined)
 const CONSOLIDATE_EVERY = 6
 
 const STATUS: Record<ReqStatus, { label: string; tone: Tone }> = {
@@ -99,6 +103,7 @@ let plat: Platform = { os: 'mac', tmp: '/tmp/principia', data: '', runner: [], e
 let storeKey = ''
 let sessionId = ''
 let project = ''
+let sessionRoot = '' // the session's folder, for the footprint
 let entry = '' // how the session was started: claude-desktop, cli, sdk-cli (headless)…
 let hasEnded = false
 let turnStartedAt = 0
@@ -134,6 +139,7 @@ async function mirror($: $T) {
       read($, signalsA), read($, planA), read($, previewsA), read($, drawnA),
     ])
     const turns = await read($, turnsA)
+    const footprint = await read($, footprintA)
     // Work that finishes after the session has gone (a review still running when you quit) sees
     // empty state; writing that would wipe the ledger, so an empty ledger never replaces a full one.
     if (!reqs.length && !events.length) {
@@ -141,7 +147,7 @@ async function mirror($: $T) {
       if (onDisk?.reqs?.length || onDisk?.events?.length) return
     }
     await $.fs.write(stateFile(), JSON.stringify({
-      sessionId, project, title, hasEnded, entry, drawn, turns: turns.slice(-400),
+      sessionId, project, cwd: sessionRoot, footprint, title, hasEnded, entry, drawn, turns: turns.slice(-400),
       reqs, replies, events: trimEvents(events), signals: signals.slice(-100), plan, previews,
       isWorking: Boolean(turnId) && !hasEnded, editors: plat.editors, snapDir: join(plat.data, 'snapshots'), theme, dark: view.dark, at: now(),
       transcriptsAllowed: await transcriptsAllowed($),
@@ -217,7 +223,7 @@ async function applyProgress($: $T, progress: Progress[], from: string): Promise
     const settled = (r.status === 'verified' && !r.needsReverify) || r.status === 'deferred' || r.status === 'revisit'
     if (!p || settled || p.status === r.status) return r
     moved++
-    return { ...r, status: p.status, evidence: [...r.evidence, { kind: 'note' as const, at: now(), text: `${from}: ${p.why}` }] }
+    return { ...renudge(r, p.status), status: p.status, evidence: [...r.evidence, { kind: 'note' as const, at: now(), text: `${from}: ${p.why}` }] }
   }))
   return moved
 }
@@ -291,7 +297,7 @@ async function capture($: $T, text: string): Promise<string[]> {
         const wasDone = target.status === 'implemented' || target.status === 'verified'
         out = out.map(r =>
           r.id === target.id
-            ? { ...r, history: [...r.history, version], needsReverify: wasDone || r.needsReverify, status: wasDone ? 'in_progress' : r.status }
+            ? { ...r, history: [...r.history, version], needsReverify: wasDone || r.needsReverify, status: wasDone ? 'in_progress' : r.status, nudgedAt: wasDone ? undefined : r.nudgedAt }
             : r,
         )
         touched.push(`${target.id} (refined): ${t.title}`)
@@ -606,6 +612,31 @@ async function askGaps($: $T): Promise<number> {
   return open.length
 }
 
+// Done but not verified is where sessions stall: the agent says it's done, nobody runs the
+// check. Once per requirement, when the session has been idle a moment after a turn, the
+// agent is asked to run the test, build or check that proves each one. /ledger nudge off stops it.
+const NUDGE_AFTER = 20_000
+
+async function nudgeVerify($: $T): Promise<number> {
+  if (hasEnded || (await $.store.get('nudge').catch(() => undefined)) === 'off') return 0
+  if (await read($, turnA)) return 0 // a new turn has started; its own review nudges later
+  const due = (await read($, reqsA)).filter(r => r.status === 'implemented' && !r.needsReverify && !r.nudgedAt)
+  if (!due.length) return 0
+  await update($, reqsA, list => list.map(r => (due.some(d => d.id === r.id) ? { ...r, nudgedAt: now() } : r)))
+  await deliver(
+    $,
+    `[Ledger] Done but not verified: ${due.map(r => `${r.id} ${r.title}`).join('; ')}. ` +
+      `For each, run the test, build or check that proves it and report with the ${TOOL} tool (status verified, with test_command). ` +
+      'If one can only be checked by hand, say in one line what to check and leave its status as is.',
+    { interrupt: false, start: true },
+  )
+  await save($)
+  return due.length
+}
+
+// A requirement that leaves "done" is nudged again the next time it gets there.
+const renudge = (r: Requirement, status: ReqStatus): Requirement => (status === 'implemented' ? r : { ...r, nudgedAt: undefined })
+
 // ---------- the terminal window ----------
 
 type InboxCommand =
@@ -812,6 +843,32 @@ async function install($: $T): Promise<string> {
   await $.fs.write(join(plat.data, 'viewer.next'), bin)
   void prune($).catch(() => undefined)
   return `Installed Principia ${RELEASE.version} (${name}, checksum verified). /ledger window opens it.`
+}
+
+// ---------- footprint: memory held now, files left behind ----------
+
+let selfPid = 0
+
+async function measureFootprint($: $T, files: boolean) {
+  if (plat.os === 'windows' || !sessionId) return
+  const prev = await read($, footprintA)
+  if (!selfPid) selfPid = Number(firstLine((await run($, ['sh', '-c', FIND_SELF]))?.stdout)) || 0
+  const ps = await run($, ['ps', '-axo', 'pid=,ppid=,rss='])
+  const { procs, ramKb } = selfPid && ps?.stdout ? treeRss(ps.stdout, selfPid) : { procs: 0, ramKb: 0 }
+  let disk = { transcriptKb: prev?.transcriptKb ?? 0, ledgerKb: prev?.ledgerKb ?? 0, workspaceKb: prev?.workspaceKb ?? 0 }
+  const workspace = workspaceOf(sessionRoot)
+  if (files || !prev) {
+    const size = async (p: string) => duKb((await run($, ['du', '-sk', p]))?.stdout ?? '')
+    // The transcript's folder is named after the session's folder, by rules of the app's own.
+    const transcript = firstLine((await run($, ['sh', '-c', 'ls "$1"/*/"$2".jsonl 2>/dev/null | head -1', 'sh', await projectsDir($), sessionId]))?.stdout)
+    disk = {
+      transcriptKb: transcript ? await size(transcript) : 0,
+      ledgerKb: await size(stateFile()),
+      workspaceKb: workspace ? await size(workspace.path) : 0,
+    }
+  }
+  await update($, footprintA, () => ({ at: now(), pid: selfPid || undefined, procs, ramKb, ...disk, workspace }))
+  await mirror($)
 }
 
 // ---------- themes ----------
@@ -1122,7 +1179,7 @@ async function ledgerTool($: $T, a: Record<string, unknown>): Promise<string> {
   if (s('note') && status !== 'revisit') evidence.push({ kind: 'note', at: now(), text: s('note') })
   await update($, reqsA, list =>
     list.map(r => (r.id === req.id
-      ? { ...r, status, evidence, needsReverify: status === 'verified' ? false : r.needsReverify, revisit: status === 'revisit' ? s('note') : undefined }
+      ? { ...renudge(r, status), status, evidence, needsReverify: status === 'verified' ? false : r.needsReverify, revisit: status === 'revisit' ? s('note') : undefined }
       : r)),
   )
   await save($)
@@ -1150,6 +1207,7 @@ export const register: Register = on => {
       sessionId = await $.session.id()
       const root = await $.session.root()
       project = projectName(root)
+      sessionRoot = root
       entry = (await $.env.get('CLAUDE_CODE_ENTRYPOINT')) ?? ''
       hasEnded = false
       storeKey = `s:${sessionId}`
@@ -1209,10 +1267,14 @@ export const register: Register = on => {
       void pollInbox($).catch(() => undefined)
       void heartbeat($)
     })
+    // Memory every half minute; the files every five, since sizing a folder costs more.
+    $.clock.after(3000, () => void measureFootprint($, true).catch(() => undefined))
+    $.clock.every(30_000, () => void measureFootprint($, false).catch(() => undefined))
+    $.clock.every(300_000, () => void measureFootprint($, true).catch(() => undefined))
     await mirror($)
     // A session started without tools refuses this; the ledger still works without it.
     await $.tool.register({ name: 'ledger', description: TOOL_DESCRIPTION, inputSchema: TOOL_SCHEMA, isDeferred: false }).catch(() => undefined)
-    await $.command.register({ name: 'ledger', description: 'Open the requirements ledger pane', argumentHint: '[window [terminal] | install | refresh | theme … | import [days | refresh | allow | revoke] | wide | narrow]' })
+    await $.command.register({ name: 'ledger', description: 'Open the requirements ledger pane', argumentHint: '[window [terminal] | install | refresh | nudge on|off | theme … | import [days | refresh | allow | revoke] | wide | narrow]' })
     void openPane($)
     return next(e)
   })
@@ -1224,6 +1286,10 @@ export const register: Register = on => {
     if (arg === 'install') return { text: await install($).catch(err => `Install failed: ${err instanceof Error ? err.message : String(err)}`) }
     if (arg === 'theme' || arg.startsWith('theme ')) return { text: await themeCommand($, raw.slice(5).trim()) }
     if (arg === 'import' || arg.startsWith('import ')) return { text: await importCommand($, arg.slice(6).trim()) }
+    if (arg === 'nudge on' || arg === 'nudge off') {
+      await $.store.set('nudge', arg.slice(6))
+      return { text: arg === 'nudge off' ? 'Principia will not ask the agent to verify on its own. /ledger nudge on turns it back on; g in the window still asks once.' : 'When a session goes idle with requirements done but not verified, Principia asks the agent to verify them, once each.' }
+    }
     if (arg === 'refresh') return { text: await refreshCommand($).catch(err => `Could not refresh: ${err instanceof Error ? err.message : String(err)}`) }
     if (arg === 'wide' || arg === 'narrow') await $.store.set('width', arg)
     const width = await openPane($)
@@ -1236,7 +1302,7 @@ export const register: Register = on => {
     // session, with no origin of its own: you asked for it there, so it's read as yours. (A
     // headless run starts the same way, but its entry point says so and it's left alone.)
     const isBrief = !kind && !(await read($, reqsA)).length && !(await read($, turnsA)).length
-    if (e.command || e.isMeta || !(HUMAN.has(kind) || isBrief) || entry.startsWith('sdk')) return next(e)
+    if (e.command || e.isMeta || !(HUMAN.has(kind) || isBrief) || entry.startsWith('sdk') || e.text.startsWith('[Ledger]')) return next(e)
     const text = clip(humanText(e.text), isBrief ? 12000 : 3000)
     if (!text) return next(e)
     const context = [...(e.context ?? [])]
@@ -1338,7 +1404,9 @@ export const register: Register = on => {
           await linkTurn($, since, until, [...new Set([...worked, ...judged])])
           // A turn's review sees only that turn; work often finishes in a later one. So every few
           // turns, every open requirement is re-judged against the whole session so far.
-          if (turns.length % CONSOLIDATE_EVERY === 0) return consolidate($)
+          if (turns.length % CONSOLIDATE_EVERY === 0) await consolidate($)
+          // Then, if the session stays idle, the agent is asked to verify what it says is done.
+          $.clock.after(NUDGE_AFTER, () => void nudgeVerify($).catch(() => undefined))
         }))
       }
       await update($, repliesA, list => list.map(r => (r.delivery === 'received' ? { ...r, delivery: 'acted' as const } : r)))
@@ -1388,8 +1456,8 @@ export const register: Register = on => {
     const { Box, Text, Button, Input, Select, Link } = $.ui.resolve(e)
     // A drawing can't write state, so the first one records itself just after.
     if (!(await read($, drawnA))) $.clock.after(0, () => void update($, drawnA, () => true).then(() => mirror($)).catch(() => undefined))
-    const [reqs, events, replies, view, signals, plan, previews, turns] = await Promise.all([
-      read($, reqsA), read($, eventsA), read($, repliesA), read($, viewA), read($, signalsA), read($, planA), read($, previewsA), read($, turnsA),
+    const [reqs, events, replies, view, signals, plan, previews, turns, footprint] = await Promise.all([
+      read($, reqsA), read($, eventsA), read($, repliesA), read($, viewA), read($, signalsA), read($, planA), read($, previewsA), read($, turnsA), read($, footprintA),
     ])
     const openSignals = signals.filter(x => !x.dismissed)
     const p = palette(await read($, themeA), view.dark)
@@ -1418,6 +1486,11 @@ export const register: Register = on => {
         <Text color={p.text2}>
           {live.length} requirements · <Text color={p.done}>{verified} verified</Text> · {live.length - verified} open
         </Text>
+        {footprint && (
+          <Text color={p.text3}>
+            {fmtKb(footprint.ramKb)} memory in {footprint.procs} process{footprint.procs === 1 ? '' : 'es'} · {fmtKb(footprint.transcriptKb + footprint.ledgerKb + footprint.workspaceKb)} on disk, local only · M in the window for details
+          </Text>
+        )}
       </Box>
     )
 

@@ -3,6 +3,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { Requirement } from '../types'
 import { filterReqs, gapOf, humanText, linkStep, linker, planFrom, previewUrls, trimEvents } from '../hooks/work'
 import { parseReview, parseTagged } from '../hooks/tagging'
+import { duKb, fmtKb, treeRss, workspaceOf } from '../hooks/footprint'
 
 const req = (id: string, title: string, extra: Partial<Requirement> = {}): Requirement => ({
   id, title, status: 'captured', at: 1, history: [{ at: 1, text: title, kind: 'original', by: 'you' }], evidence: [], ...extra,
@@ -154,5 +155,20 @@ describe('your words', () => {
     expect(humanText('Fix it <system-reminder>x</system-reminder> please')).toBe('Fix it  please')
     expect(humanText('<local-command-caveat>ran</local-command-caveat><command-name>/ledger</command-name>')).toBe('')
     expect(humanText('  plain  ')).toBe('plain')
+  })
+})
+
+describe('footprint', () => {
+  test('memory is summed over the session process and everything it started', () => {
+    const ps = ' 100   1 50000\n 200 100 1000\n 300 200 2000\n 400   1 9999\n 500 100 0\n'
+    expect(treeRss(ps, 100)).toEqual({ procs: 4, ramKb: 53000 })
+    expect(treeRss(ps, 999)).toEqual({ procs: 0, ramKb: 0 })
+  })
+  test("a session's own folder is the app's scratch folder or a worktree, never your project", () => {
+    expect(workspaceOf('/Users/a/Library/Application Support/Claude/scratch-workspaces/x/y/scratch-1')?.kind).toBe('scratch')
+    expect(workspaceOf('/Users/a/Projects/app/.claude/worktrees/fix-1')?.kind).toBe('worktree')
+    expect(workspaceOf('/Users/a/Projects/app')).toBeUndefined()
+    expect(duKb('123456\t/some/path\n')).toBe(123456)
+    expect([fmtKb(512), fmtKb(2048), fmtKb(3 * 1024 * 1024)]).toEqual(['512 KB', '2 MB', '3.0 GB'])
   })
 })

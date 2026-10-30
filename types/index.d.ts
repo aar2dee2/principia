@@ -34,6 +34,8 @@ export type Requirement = {
   conflict?: { reason: string; at: number; source: 'you' | 'agent' }
   // Done for now: when or why to come back to it, in your words (status 'revisit').
   revisit?: string
+  // When the agent was last asked to verify this (status 'implemented'); cleared when it leaves that status.
+  nudgedAt?: number
 }
 
 // Things worth acting on that are easy to miss in the chat: a tool call that failed or was
@@ -59,6 +61,19 @@ export type PlanStep = {
 }
 
 export type Preview = { url: string; at: number; eventId: string }
+
+// What the session costs this computer (the same shape as hooks/footprint.ts): memory its
+// processes hold now, and the files it leaves, in KB.
+export type Footprint = {
+  at: number
+  pid?: number
+  procs: number
+  ramKb: number
+  transcriptKb: number
+  ledgerKb: number
+  workspaceKb: number
+  workspace?: { path: string; kind: 'scratch' | 'worktree' }
+}
 
 export type EventKind = 'discovery' | 'plan' | 'code' | 'command' | 'test' | 'message'
 
@@ -142,6 +157,7 @@ declare module 'claude-code' {
       drawn: boolean
       turns: { at: number; ask: string; answer: string }[]
       previews: Preview[]
+      footprint?: Footprint
     }
   }
 }

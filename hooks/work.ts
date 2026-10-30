@@ -55,6 +55,13 @@ export function failureText(tool: string, text: string): string {
   return `${tool}: ${first.length > 220 ? `${first.slice(0, 219)}…` : first || 'failed'}`
 }
 
+// Your words alone: without the reminders the app puts around a message, and nothing at all
+// for a command wrapper (a slash command's output, an IDE notice). Mirrors the importer.
+export function humanText(text: string): string {
+  const t = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
+  return /^<(local-command|command-|ide_|user-prompt-submit-hook)/.test(t) ? '' : t
+}
+
 // ---------- shared by the pane and the window ----------
 
 export type ReqFilterName = 'all' | 'open' | 'unverified' | 'verified' | 'revisit' | 'conflicts' | 'yours' | 'agents'

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import type { Requirement } from '../types'
-import { filterReqs, gapOf, linkStep, linker, planFrom, previewUrls, trimEvents } from '../hooks/work'
+import { filterReqs, gapOf, humanText, linkStep, linker, planFrom, previewUrls, trimEvents } from '../hooks/work'
 import { parseReview, parseTagged } from '../hooks/tagging'
 
 const req = (id: string, title: string, extra: Partial<Requirement> = {}): Requirement => ({
@@ -145,5 +145,14 @@ describe('how much activity is kept', () => {
     // Within the full window nothing changes, and the same array comes back.
     const small = list.slice(0, 5)
     expect(trimEvents(small, 20, 5)).toBe(small)
+  })
+})
+
+describe('your words', () => {
+  test('reminders around a message are cut out; command wrappers are nothing', () => {
+    expect(humanText('<system-reminder>\nLinked sessions now: a = b (idle)\n</system-reminder>\nResearch AI in Formula 1')).toBe('Research AI in Formula 1')
+    expect(humanText('Fix it <system-reminder>x</system-reminder> please')).toBe('Fix it  please')
+    expect(humanText('<local-command-caveat>ran</local-command-caveat><command-name>/ledger</command-name>')).toBe('')
+    expect(humanText('  plain  ')).toBe('plain')
   })
 })

@@ -20,7 +20,7 @@ import type {
 } from '../types'
 import { REVIEW_SYSTEM, TAG_SYSTEM, buildLedger, judgeStatuses, parseReview, parseTagged, reviewPrompt, tagPrompt, turnsAsConversation } from './tagging'
 import type { Complete, LedgerItem, PastPrompt, Progress, Tagged, Turn } from './tagging'
-import { PLAN_TOOLS, REQ_FILTERS, failureText, filterReqs, gapOf, isSecretPath, linker, planFrom, previewUrls, trimEvents } from './work'
+import { PLAN_TOOLS, REQ_FILTERS, failureText, filterReqs, gapOf, humanText, isSecretPath, linker, planFrom, previewUrls, trimEvents } from './work'
 import type { ReqFilterName } from './work'
 import { RELEASE } from './release'
 import { EDITORS, LINUX, MAC, WINDOWS, base, firstLine, join, launchCommand, programName } from './platform'
@@ -1231,10 +1231,17 @@ export const register: Register = on => {
   })
 
   on('prompt.submit', async ($, e, next) => {
-    if (e.command || e.isMeta || !HUMAN.has(e.origin.kind) || entry.startsWith('sdk')) return next(e)
+    const kind = (e as { origin?: { kind?: string } }).origin?.kind ?? ''
+    // A session started from another session gets its whole task as a first message from that
+    // session, with no origin of its own: you asked for it there, so it's read as yours. (A
+    // headless run starts the same way, but its entry point says so and it's left alone.)
+    const isBrief = !kind && !(await read($, reqsA)).length && !(await read($, turnsA)).length
+    if (e.command || e.isMeta || !(HUMAN.has(kind) || isBrief) || entry.startsWith('sdk')) return next(e)
+    const text = clip(humanText(e.text), isBrief ? 12000 : 3000)
+    if (!text) return next(e)
     const context = [...(e.context ?? [])]
-    if (!(await read($, titleA))) await update($, titleA, () => clip(e.text.replace(/\s+/g, ' ').trim(), 70))
-    const touched = await capture($, e.text)
+    if (!(await read($, titleA))) await update($, titleA, () => clip(text.replace(/\s+/g, ' '), 70))
+    const touched = await capture($, text)
     linkReqs(touched.map(t => /^R\d+/.exec(t)?.[0] ?? ''))
     if (touched.length) {
       context.push(`[Ledger] Captured from this message:\n${touched.join('\n')}\nReport progress with the ${TOOL} tool.`)
@@ -1305,7 +1312,7 @@ export const register: Register = on => {
   on('turn.start', async ($, e, next) => {
     if (!e.agentId) {
       turnStartedAt = now()
-      turnAsk = e.text
+      turnAsk = humanText(e.text)
       await update($, turnA, () => e.turnId)
       await mirror($)
     }

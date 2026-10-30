@@ -17,7 +17,7 @@ export const TAG_SYSTEM =
   'A request phrased as a question ("how do I make it…", "can we…", "could you…", "why isn\'t X…") IS a requirement: state the outcome the user wants. ' +
   '"Can we not get X", "couldn\'t we X", "why not X" and "shouldn\'t it X" ask FOR X: the title is X, never its opposite. ' +
   'A question about something that looks wrong ("why is it blank?", "why are there so many files?") asks for it to be fixed: a requirement. So is asking to be shown, opened or given something. ' +
-  'Not requirements: questions asked only to understand how something works or what it costs, or to check whether something is possible or was done ("is that possible?", "did you overwrite X?"), approvals ("yes", "go ahead", "continue"), and chit-chat. ' +
+  'Not requirements: questions asked only to understand how something works or what it costs, or to check whether something is possible or was done ("is that possible?", "did you overwrite X?"), approvals ("yes", "go ahead", "continue"), chit-chat, and messages that only report what happened or was decided (a status report, a message relayed from another session, "I chose not to do X"). ' +
   'If a message asks for a change, include it even when it is worded loosely. ' +
   'Examples. "Can we not show it in a separate window?" → [{"title":"Show it in a separate window"}]. ' +
   '"Why not keep the old colours?" → [{"title":"Keep the old colours"}]. ' +

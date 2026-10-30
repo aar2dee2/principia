@@ -36,6 +36,8 @@ export type Requirement = {
   revisit?: string
   // When the agent was last asked to verify this (status 'implemented'); cleared when it leaves that status.
   nudgedAt?: number
+  // Nothing can be run to verify this: what a person should check instead (status 'implemented').
+  manual?: string
 }
 
 // Things worth acting on that are easy to miss in the chat: a tool call that failed or was

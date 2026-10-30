@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import type { Requirement } from '../types'
-import { filterReqs, gapOf, humanText, linkStep, linker, planFrom, previewUrls, trimEvents } from '../hooks/work'
+import { filterReqs, findCheck, gapOf, humanText, linkStep, linker, planFrom, previewUrls, trimEvents } from '../hooks/work'
 import { parseReview, parseTagged } from '../hooks/tagging'
 import { duKb, fmtKb, treeRss, workspaceOf } from '../hooks/footprint'
 
@@ -170,5 +170,49 @@ describe('footprint', () => {
     expect(workspaceOf('/Users/a/Projects/app')).toBeUndefined()
     expect(duKb('123456\t/some/path\n')).toBe(123456)
     expect([fmtKb(512), fmtKb(2048), fmtKb(3 * 1024 * 1024)]).toEqual(['512 KB', '2 MB', '3.0 GB'])
+  })
+})
+
+describe('findCheck', () => {
+  const ev = (id: string, kind: 'code' | 'test' | 'command', at: number, detail: string, state: 'ok' | 'failed' | 'running' = 'ok') =>
+    ({ id, kind, at, title: detail.slice(0, 40), detail, state })
+  const edit = ev('e1', 'code', 1000, 'Edited reel.py')
+  const FFPROBE = 'ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 jobs/2026-10-30_161335_reelA/versions/v1/reel.mp4'
+
+  test('any shell command that passed after the last edit counts, not only test-looking ones', () => {
+    const got = findCheck([edit, ev('b1', 'command', 2000, FFPROBE)], 'ffprobe -v error')
+    expect('pass' in got && got.pass.id).toBe('b1')
+  })
+  test('a part of a compound command or pipe matches', () => {
+    const got = findCheck([edit, ev('b1', 'command', 2000, './reel stop; pgrep -fl "reels.cli watch" || echo watcher stopped')], 'pgrep -fl "reels.cli watch"')
+    expect('pass' in got).toBe(true)
+    const piped = findCheck([edit, ev('b2', 'command', 2000, 'git log --all --oneline | grep "Word-anchored"')], 'git log --all --oneline | grep "Word-anchored"')
+    expect('pass' in piped).toBe(true)
+  })
+  test('whitespace differences do not matter', () => {
+    const got = findCheck([edit, ev('b1', 'test', 2000, 'python  -m unittest\n  tests')], 'python -m unittest tests')
+    expect('pass' in got).toBe(true)
+  })
+  test('an older event whose command was clipped still matches on its kept prefix', () => {
+    const clipped = trimEvents([ev('b1', 'command', 2000, FFPROBE), ...Array.from({ length: 3 }, (_, i) => ev(`x${i}`, 'command', 3000 + i, 'ls'))], 10, 2)
+    const got = findCheck([edit, ...clipped], FFPROBE)
+    expect('pass' in got).toBe(true)
+  })
+  test('the refusal says what failed', () => {
+    const never = findCheck([edit], 'ffprobe -v error')
+    expect('why' in never && never.why).toContain('no shell command containing')
+    const failed = findCheck([edit, ev('b1', 'command', 2000, FFPROBE, 'failed')], 'ffprobe')
+    expect('why' in failed && failed.why).toContain('failed')
+    const stale = findCheck([ev('b1', 'command', 500, FFPROBE), edit], 'ffprobe')
+    expect('why' in stale && stale.why).toContain('before your last edit')
+    expect('why' in stale && stale.why).toContain('Edited reel.py')
+    const running = findCheck([edit, ev('b1', 'command', 2000, FFPROBE, 'running')], 'ffprobe')
+    expect('why' in running && running.why).toContain('still running')
+    const short = findCheck([edit, ev('b1', 'command', 2000, FFPROBE)], 'ls')
+    expect('why' in short && short.why).toContain('at least 4')
+  })
+  test('a passing run before a later edit does not count, one after it does', () => {
+    const got = findCheck([ev('b0', 'test', 500, 'bun test', 'ok'), edit, ev('b1', 'test', 1500, 'bun test', 'ok')], 'bun test')
+    expect('pass' in got && got.pass.id).toBe('b1')
   })
 })

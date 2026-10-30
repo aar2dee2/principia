@@ -20,7 +20,7 @@ import type {
 } from '../types'
 import { REVIEW_SYSTEM, TAG_SYSTEM, buildLedger, judgeStatuses, parseReview, parseTagged, reviewPrompt, tagPrompt, turnsAsConversation } from './tagging'
 import type { Complete, LedgerItem, PastPrompt, Progress, Tagged, Turn } from './tagging'
-import { PLAN_TOOLS, REQ_FILTERS, failureText, filterReqs, gapOf, humanText, isSecretPath, linker, planFrom, previewUrls, trimEvents } from './work'
+import { PLAN_TOOLS, REQ_FILTERS, failureText, filterReqs, findCheck, gapOf, humanText, isSecretPath, linker, planFrom, previewUrls, trimEvents } from './work'
 import type { ReqFilterName } from './work'
 import { RELEASE } from './release'
 import { FIND_SELF, duKb, fmtKb, treeRss, workspaceOf } from './footprint'
@@ -223,7 +223,7 @@ async function applyProgress($: $T, progress: Progress[], from: string): Promise
     const settled = (r.status === 'verified' && !r.needsReverify) || r.status === 'deferred' || r.status === 'revisit'
     if (!p || settled || p.status === r.status) return r
     moved++
-    return { ...renudge(r, p.status), status: p.status, evidence: [...r.evidence, { kind: 'note' as const, at: now(), text: `${from}: ${p.why}` }] }
+    return { ...r, status: p.status, evidence: [...r.evidence, { kind: 'note' as const, at: now(), text: `${from}: ${p.why}` }] }
   }))
   return moved
 }
@@ -620,22 +620,24 @@ const NUDGE_AFTER = 20_000
 async function nudgeVerify($: $T): Promise<number> {
   if (hasEnded || (await $.store.get('nudge').catch(() => undefined)) === 'off') return 0
   if (await read($, turnA)) return 0 // a new turn has started; its own review nudges later
-  const due = (await read($, reqsA)).filter(r => r.status === 'implemented' && !r.needsReverify && !r.nudgedAt)
+  const due = (await read($, reqsA)).filter(r => r.status === 'implemented' && !r.needsReverify && !r.nudgedAt && !r.manual)
   if (!due.length) return 0
   await update($, reqsA, list => list.map(r => (due.some(d => d.id === r.id) ? { ...r, nudgedAt: now() } : r)))
   await deliver(
     $,
     `[Ledger] Done but not verified: ${due.map(r => `${r.id} ${r.title}`).join('; ')}. ` +
-      `For each, run the test, build or check that proves it and report with the ${TOOL} tool (status verified, with test_command). ` +
-      'If one can only be checked by hand, say in one line what to check and leave its status as is.',
+      `For each, run the command that proves it (a test, build, ffprobe, grep, curl, your own script: any Bash call that exits 0) and report with the ${TOOL} tool (status verified, test_command = a distinctive part of that command). ` +
+      'If one can only be checked by hand (research, writing, a video to watch), update it with manual_check saying what to check; it will not be asked about again.',
     { interrupt: false, start: true },
   )
   await save($)
   return due.length
 }
 
-// A requirement that leaves "done" is nudged again the next time it gets there.
-const renudge = (r: Requirement, status: ReqStatus): Requirement => (status === 'implemented' ? r : { ...r, nudgedAt: undefined })
+// A requirement the agent (or a refinement from you) takes out of "done" is nudged again the
+// next time it gets there. Haiku's own re-judgements don't count: they flip statuses back and
+// forth, and each flip used to bring the same nudge again.
+const renudge = (r: Requirement, status: ReqStatus): Requirement => (status === 'implemented' ? r : { ...r, nudgedAt: undefined, manual: undefined })
 
 // ---------- the terminal window ----------
 
@@ -1118,7 +1120,10 @@ async function refreshCommand($: $T): Promise<string> {
 
 const TOOL_DESCRIPTION =
   "The user's requirements ledger (R1, R2…). Update a requirement when you start, finish, get blocked or need clarification; add one to split a requirement. " +
-  '"verified" needs test_command: part of a test/build command that passed after your last edit. ' +
+  '"verified" needs test_command: a distinctive part of a shell (Bash tool) command that ran and exited 0 after your last Edit/Write. ' +
+  'Any command counts (tests, builds, ffprobe, grep, curl, your own scripts), on its own or inside a compound command or pipe; ' +
+  'files changed by shell commands are not edits. When nothing can be run (research, writing, a video to watch), ' +
+  'set manual_check to what a person should check: the requirement stays "done, not verified" and is not asked about again. ' +
   'Start plan and todo items with the ids they serve, e.g. "[R2] Add search".'
 
 const TOOL_SCHEMA = {
@@ -1127,7 +1132,8 @@ const TOOL_SCHEMA = {
     action: { type: 'string', enum: ['update', 'add', 'detach'] },
     id: { type: 'string' },
     status: { type: 'string', enum: ['in_progress', 'implemented', 'verified', 'blocked', 'needs_clarification', 'revisit'] },
-    test_command: { type: 'string' },
+    test_command: { type: 'string', description: 'verified: part of a Bash command that exited 0 after your last edit' },
+    manual_check: { type: 'string', description: 'what a person should check when nothing can be run; stops the verify nudge for this requirement' },
     note: { type: 'string' },
     title: { type: 'string', description: 'add: the new requirement' },
     derived_from: { type: 'string', description: 'add: id it splits' },
@@ -1157,30 +1163,42 @@ async function ledgerTool($: $T, a: Record<string, unknown>): Promise<string> {
   const req = reqs.find(r => r.id === s('id'))
   if (!req) return `No requirement ${s('id')}. Known: ${reqs.map(r => r.id).join(', ') || 'none'}.`
   linkReqs([req.id])
-  let status = (s('status') || req.status) as ReqStatus
+  let status = (s('status') || (s('manual_check') ? 'implemented' : req.status)) as ReqStatus
   let reply = `${req.id} → ${STATUS[status].label}.`
   const evidence = [...req.evidence]
+  let manual = status === 'implemented' ? req.manual : undefined
   if (status === 'verified') {
-    const events = await read($, eventsA)
-    const lastEdit = Math.max(0, ...events.filter(x => x.kind === 'code').map(x => x.at))
-    // Evidence is a test, build or check command (not any command), named by a real part of it.
-    const cmd = s('test_command').trim().length >= 4 ? s('test_command').trim() : ''
-    const pass = cmd
-      ? [...events].reverse().find(x => x.kind === 'test' && x.state === 'ok' && x.at >= lastEdit && (x.detail ?? '').includes(cmd))
-      : undefined
-    if (pass) {
-      evidence.push({ kind: 'test', at: now(), text: pass.detail ?? pass.title, eventId: pass.id })
+    // Evidence is a command the agent names that ran and passed after the last edit; the
+    // refusal says which of those failed, so the agent doesn't just run it again blindly.
+    const found = findCheck(await read($, eventsA), s('test_command'))
+    if ('pass' in found) {
+      evidence.push({ kind: 'test', at: now(), text: found.pass.detail ?? found.pass.title, eventId: found.pass.id })
+      manual = undefined
     } else {
       status = 'implemented'
-      reply = `${req.id} recorded as done but NOT verified: no passing test, build or check command matching "${s('test_command')}" ran after the last edit. Run one, then update again.`
+      manual = req.manual
+      reply = `${req.id} recorded as done but NOT verified: ${found.why}. If nothing can be run, update with manual_check instead.`
     }
+  }
+  if (s('manual_check').trim().length >= 4 && status === 'implemented') {
+    manual = s('manual_check').trim()
+    evidence.push({ kind: 'note', at: now(), text: `Check by hand: ${manual}` })
+    reply = `${req.id} → ${STATUS[status].label} · check by hand: ${manual}. It won't be asked about again; the person accepts it with "a" in the window.`
   }
   if (status === 'revisit' && !s('note')) return `${req.id}: "revisit" needs a note saying when or why to come back to it.`
   if (s('note') && status !== 'revisit') evidence.push({ kind: 'note', at: now(), text: s('note') })
   await update($, reqsA, list =>
-    list.map(r => (r.id === req.id
-      ? { ...renudge(r, status), status, evidence, needsReverify: status === 'verified' ? false : r.needsReverify, revisit: status === 'revisit' ? s('note') : undefined }
-      : r)),
+    list.map(r => {
+      if (r.id !== req.id) return r
+      const base = renudge(r, status)
+      return {
+        ...base, status, evidence, manual,
+        // A check by hand counts as this session's one nudge: it is not asked about again.
+        nudgedAt: manual ? base.nudgedAt ?? now() : base.nudgedAt,
+        needsReverify: status === 'verified' ? false : r.needsReverify,
+        revisit: status === 'revisit' ? s('note') : undefined,
+      }
+    }),
   )
   await save($)
   return reply

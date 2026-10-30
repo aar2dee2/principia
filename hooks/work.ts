@@ -176,3 +176,34 @@ export function linker(reqs: Requirement[], asks: number[] = []): (ev: ActivityE
     return start === undefined ? [] : [...new Set(byTime.get(start) ?? [])]
   }
 }
+
+// ---------- what counts as the check that verifies a requirement ----------
+
+const squash = (s: string) => s.replace(/\s+/g, ' ').trim()
+const hm = (t: number) => new Date(t).toTimeString().slice(0, 5)
+
+// The agent names part of a command it ran; verification needs that command to have run and
+// exited 0 after the last edit (an Edit, Write or NotebookEdit; files changed by shell commands
+// don't count). Any shell command qualifies, not only ones that look like tests: ffprobe, grep,
+// curl or a project's own script are checks when the agent names them. Compound commands and
+// pipes match on any part of their text. Older events keep only the start of their command, so
+// a command the kept prefix fits is also a match.
+export function findCheck(events: ActivityEvent[], named: string): { pass: ActivityEvent } | { why: string } {
+  const cmd = squash(named)
+  if (cmd.length < 4) return { why: 'test_command must be a real part of the command that proves it (at least 4 characters)' }
+  const lastEdit = events.filter(x => x.kind === 'code').sort((a, b) => b.at - a.at)[0]
+  const matches = (x: ActivityEvent) => {
+    if (x.kind !== 'test' && x.kind !== 'command') return false
+    const d = squash(x.detail ?? '')
+    return d.includes(cmd) || (d.endsWith('…') && d.length > 8 && cmd.startsWith(d.slice(0, -1)))
+  }
+  const ran = events.filter(matches)
+  if (!ran.length) return { why: `no shell command containing "${cmd}" has run in this session (the ledger sees Bash calls, not commands typed in a terminal)` }
+  const since = lastEdit?.at ?? 0
+  const pass = [...ran].reverse().find(x => x.state === 'ok' && x.at >= since)
+  if (pass) return { pass }
+  const latest = ran[ran.length - 1]
+  if (latest.state === 'running') return { why: `"${cmd}" is still running; update again once it has finished` }
+  if (latest.state === 'failed') return { why: `"${cmd}" last ran at ${hm(latest.at)} and failed; it has to exit 0` }
+  return { why: `"${cmd}" last passed at ${hm(latest.at)}, before your last edit at ${hm(since)} (${lastEdit?.title ?? 'a file'}); run it again` }
+}

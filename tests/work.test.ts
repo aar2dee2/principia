@@ -3,7 +3,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { Requirement } from '../types'
 import { filterReqs, findCheck, gapOf, humanText, linkStep, linker, planFrom, previewUrls, trimEvents } from '../hooks/work'
 import { parseReview, parseTagged } from '../hooks/tagging'
-import { cacheDirs, duKb, duLines, fetchedPaths, fmtKb, ignoredPaths, sumKb, treeRss, workspaceOf } from '../hooks/footprint'
+import { cacheDirs, changedPaths, duKb, duLines, fetchedPaths, fmtKb, ignoredPaths, sumKb, treeRss, workspaceOf, writtenPaths } from '../hooks/footprint'
 
 const req = (id: string, title: string, extra: Partial<Requirement> = {}): Requirement => ({
   id, title, status: 'captured', at: 1, history: [{ at: 1, text: title, kind: 'original', by: 'you' }], evidence: [], ...extra,
@@ -135,13 +135,14 @@ describe('activity per requirement', () => {
 
 describe('how much activity is kept', () => {
   test('old events are kept lean rather than dropped', () => {
-    const ev = (i: number) => ({ id: String(i), kind: 'command' as const, at: i, title: `t${i}`, detail: 'x'.repeat(500), diff: 'd' })
+    const ev = (i: number) => ({ id: String(i), kind: (i % 2 ? 'command' : 'plan') as 'command' | 'plan', at: i, title: `t${i}`, detail: 'x'.repeat(900), diff: 'd' })
     const list = Array.from({ length: 30 }, (_, i) => ev(i))
     const kept = trimEvents(list, 20, 5)
     expect(kept.map(e => e.id)).toEqual(list.slice(-20).map(e => e.id))
-    expect(kept[0].detail?.length).toBe(160)
+    expect(kept[0].detail?.length).toBe(160) // a plan
+    expect(kept[1].detail?.length).toBe(600) // a command keeps more: the footprint reads it
     expect('diff' in kept[0]).toBe(false)
-    expect(kept.at(-1)?.detail?.length).toBe(500)
+    expect(kept.at(-1)?.detail?.length).toBe(900)
     expect(kept.at(-1)?.diff).toBe('d')
     // Within the full window nothing changes, and the same array comes back.
     const small = list.slice(0, 5)
@@ -188,6 +189,21 @@ describe('footprint', () => {
       'ls -o something',
     ], '/p', '/home/u')
     expect(got).toEqual(['/p/dist/tool.tgz', '/tmp/a b.zip', '/home/u/Downloads/m.bin', '/p/repo', '/p/vendor/other', '/p/third', '/p/bins'])
+  })
+  test('files shell commands wrote to are found where the command named them', () => {
+    const got = writtenPaths([
+      'echo hi > notes.txt && cat notes.txt',
+      'python3 - <<EOF\nprint(1)\nEOF',
+      "sed -i '' 's/a/b/' hooks/release.ts",
+      'ls >> "logs/run log.txt" 2>&1',
+      'cmd 2>/dev/null; other > /dev/null',
+      'make | tee -a build.log',
+      'if [ $x -gt 3 ]; then echo big; fi',
+    ], '/p', '/h')
+    expect(got.sort()).toEqual(['/p/build.log', '/p/hooks/release.ts', '/p/logs/run log.txt', '/p/notes.txt'])
+  })
+  test('uncommitted changes come from git status, renames by their new name', () => {
+    expect(changedPaths(' M hooks/a.ts\n?? new dir/\nR  old.ts -> new.ts\n', '/p')).toEqual(['/p/hooks/a.ts', '/p/new dir', '/p/new.ts'])
   })
   test('ignored content comes from git, minus the OS litter', () => {
     expect(ignoredPaths('node_modules/\n.DS_Store\ndist/\ndist/a.js\n.gstack/\n.gstack/x.log\n\nsrc/.DS_Store\n', '/p/')).toEqual(['/p/node_modules', '/p/dist', '/p/.gstack'])

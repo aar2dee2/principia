@@ -280,14 +280,23 @@ function checkBackup() {
 }
 // Every session, with what it costs: live ones report their memory and folder themselves.
 function footList() {
+  // Several sessions can run in one scratch folder: it is charged to the newest measurement only.
+  const folderOwner = new Map()
+  for (const st of sessionList()) {
+    const f = st.footprint
+    if (f?.workspace && (!folderOwner.has(f.workspace.path) || folderOwner.get(f.workspace.path).at < f.at)) folderOwner.set(f.workspace.path, { at: f.at, id: st.sessionId })
+  }
+  const sharers = p => sessionList().filter(s => s.footprint?.workspace?.path === p).length
   return sessionList().map(st => {
     const f = st.footprint ?? {}
     const live = isLive(st)
     const transcriptKb = sizeKb(transcriptOf.get(st.sessionId) ?? '') || f.transcriptKb || 0
     const ledgerKb = sizeKb(path.join(dir, `state-${st.sessionId}.json`))
-    const workspaceKb = f.workspace ? f.workspaceKb || 0 : 0
+    const ownsFolder = f.workspace && folderOwner.get(f.workspace.path)?.id === st.sessionId
+    const folderSharers = f.workspace ? sharers(f.workspace.path) : 0
+    const workspaceKb = ownsFolder ? f.workspaceKb || 0 : 0
     const editedKb = f.editedKb || 0, scratchKb = f.scratchKb || 0, fetchedKb = f.fetchedKb || 0
-    return { st, live, f, ramKb: live ? f.ramKb || 0 : 0, procs: live ? f.procs || 0 : 0, transcriptKb, ledgerKb, workspaceKb, workspace: f.workspace,
+    return { st, live, f, ramKb: live ? f.ramKb || 0 : 0, procs: live ? f.procs || 0 : 0, transcriptKb, ledgerKb, workspaceKb, workspace: f.workspace, ownsFolder, folderSharers,
       editedKb, scratchKb, fetchedKb, diskKb: transcriptKb + ledgerKb + workspaceKb + editedKb + scratchKb + fetchedKb }
   }).sort((a, b) => (b.ramKb + b.diskKb) - (a.ramKb + a.diskKb))
 }
@@ -394,7 +403,7 @@ function middleLines(w, withSignals) {
       lines.push({ sel: isSel('footprint', i), line: [seg(name.padEnd(w - cw * 4 - 2), x.live ? P.text : P.text3),
         seg((x.live ? fmtKb(x.ramKb) : '–').padStart(cw), x.live ? P.active : P.text3), seg(fmtKb(x.diskKb).padStart(cw), P.text),
         seg((x.f.editedFiles ? fmtKb(x.editedKb) : '–').padStart(cw), x.f.editedFiles ? P.text2 : P.text3),
-        seg((x.workspace ? fmtKb(x.workspaceKb) : '–').padStart(cw), x.workspace ? P.warn : P.text3)] })
+        seg((x.workspace ? (x.ownsFolder ? fmtKb(x.workspaceKb) : 'shared') : '–').padStart(cw), x.workspace && x.ownsFolder ? P.warn : P.text3)] })
     })
     if (shared.projects.length || shared.caches) {
       lines.push([], [seg('SHARED', P.text2, undefined, true), seg('  counted once, not per session', P.text3)])
@@ -458,8 +467,9 @@ function detailLines(w) {
     lines.push(...wrap(`Transcript ${fmtKb(x.transcriptKb)}: ${LIFETIME.transcript(keepDays)}.`, w, P.text2, '  '))
     if (transcriptOf.get(x.st.sessionId)) lines.push(...wrap(transcriptOf.get(x.st.sessionId).replace(HOME, '~'), w, P.text3, '    '))
     lines.push(...wrap(`Ledger ${fmtKb(x.ledgerKb)}: ${LIFETIME.ledger}.`, w, P.text2, '  '))
-    if (x.workspace) lines.push(...wrap(`Folder ${fmtKb(x.workspaceKb)}: ${LIFETIME[x.workspace.kind]}.`, w, P.text2, '  '), ...wrap(x.workspace.path.replace(HOME, '~'), w, P.text3, '    '))
+    if (x.workspace) lines.push(...wrap(`Folder ${fmtKb(x.ownsFolder ? x.workspaceKb : f.workspaceKb || 0)}${x.folderSharers > 1 ? ` (shared by ${x.folderSharers} sessions, counted once)` : ''}: ${LIFETIME[x.workspace.kind]}.`, w, P.text2, '  '), ...wrap(x.workspace.path.replace(HOME, '~'), w, P.text3, '    '))
     else lines.push(...wrap('No folder of its own: it works in your project, which is yours to keep.', w, P.text2, '  '))
+    if (f.uncommittedFiles) lines.push(...wrap(`Uncommitted in the project ${fmtKb(f.uncommittedKb || 0)} in ${f.uncommittedFiles} file${f.uncommittedFiles === 1 ? '' : 's'}: ${LIFETIME.uncommitted}.`, w, P.text2, '  '))
     if (f.editedFiles !== undefined) lines.push(...wrap(`Edited ${fmtKb(x.editedKb)} in ${f.editedFiles} file${f.editedFiles === 1 ? '' : 's'}: ${LIFETIME.edited}.`, w, P.text2, '  '))
     if (f.scratch) lines.push(...wrap(`Temp folder ${fmtKb(x.scratchKb)}: ${LIFETIME.scratchpad}.`, w, P.text2, '  '), ...wrap(f.scratch.replace(HOME, '~'), w, P.text3, '    '))
     if (f.fetched?.length) {

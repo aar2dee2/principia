@@ -23,7 +23,7 @@ import type { Complete, LedgerItem, PastPrompt, Progress, Tagged, Turn } from '.
 import { PLAN_TOOLS, REQ_FILTERS, failureText, filterReqs, findCheck, gapOf, humanText, isSecretPath, linker, planFrom, previewUrls, trimEvents } from './work'
 import type { ReqFilterName } from './work'
 import { RELEASE } from './release'
-import { FIND_SELF, SHARED_NAMES, cacheDirs, duKb, duLines, fetchedPaths, fmtKb, ignoredPaths, sumKb, treeRss, workspaceOf } from './footprint'
+import { FIND_SELF, SHARED_NAMES, cacheDirs, changedPaths, duKb, duLines, fetchedPaths, fmtKb, ignoredPaths, sumKb, treeRss, workspaceOf, writtenPaths } from './footprint'
 import type { Sized } from './footprint'
 import type { Footprint } from './footprint'
 import { EDITORS, LINUX, MAC, WINDOWS, base, firstLine, join, launchCommand, programName } from './platform'
@@ -869,9 +869,16 @@ async function measureFootprint($: $T, files: boolean) {
     const transcript = firstLine((await run($, ['sh', '-c', 'ls "$1"/*/"$2".jsonl 2>/dev/null | head -1', 'sh', await projectsDir($), sessionId]))?.stdout)
     const events = await read($, eventsA)
     // Files this session wrote or changed, and what its commands downloaded, come from its activity.
-    const edited = [...new Set(events.filter(x => x.kind === 'code' && x.file && !isSecretPath(x.file)).map(x => x.file as string))]
     const home = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE')) || ''
-    const fetched = await sizes(fetchedPaths(events.filter(x => x.kind === 'command' || x.kind === 'test').map(x => x.detail ?? ''), sessionRoot, home))
+    const commands = events.filter(x => x.kind === 'command' || x.kind === 'test').map(x => x.detail ?? '')
+    const edited = [...new Set([
+      ...events.filter(x => x.kind === 'code' && x.file).map(x => x.file as string),
+      ...writtenPaths(commands, sessionRoot, home),
+    ])].filter(f => !isSecretPath(f))
+    const fetched = await sizes(fetchedPaths(commands, sessionRoot, home))
+    // Edits made by scripts show up only here: what git sees changed in the project, by anyone.
+    const gitStatus = sessionRoot ? (await run($, ['git', '-C', sessionRoot, 'status', '--porcelain']))?.stdout ?? '' : ''
+    const uncommitted = await sizes(changedPaths(gitStatus, sessionRoot))
     // The app's temp folder for this session lives under the system's temp folder, by session id.
     const scratch = (await run($, ['sh', '-c', 'd=$(find "/tmp/claude-$(id -u)" -maxdepth 2 -type d -name "$1" 2>/dev/null | head -1); [ -n "$d" ] && du -sk "$d"', 'sh', sessionId]))?.stdout ?? ''
     const scratchLine = duLines(scratch)[0]
@@ -885,6 +892,7 @@ async function measureFootprint($: $T, files: boolean) {
       ledgerKb: await size(stateFile()),
       workspaceKb: workspace ? await size(workspace.path) : 0,
       editedKb: sumKb(await sizes(edited)), editedFiles: edited.length,
+      uncommittedKb: sumKb(uncommitted), uncommittedFiles: uncommitted.length,
       scratchKb: scratchLine?.kb ?? 0, scratch: scratchLine?.path,
       fetchedKb: sumKb(fetched), fetched: fetched.slice(0, 12),
       sharedKb: sumKb(shared), shared: shared.slice(0, 8),

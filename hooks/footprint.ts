@@ -15,9 +15,13 @@ export type Footprint = {
   workspaceKb: number
   // A folder that exists only for this session: the app's scratch folder, or a git worktree.
   workspace?: { path: string; kind: 'scratch' | 'worktree' }
-  // Files in your project this session wrote or changed (Edit and Write calls).
+  // Files in your project this session wrote or changed: Edit and Write calls, and files its
+  // shell commands named as what they write to (> file, tee, sed -i).
   editedKb?: number
   editedFiles?: number
+  // Changes in the project not yet committed, whichever session made them (git status).
+  uncommittedKb?: number
+  uncommittedFiles?: number
   // The app's temp folder for this session (its scratchpad).
   scratchKb?: number
   scratch?: string
@@ -111,6 +115,31 @@ export function fetchedPaths(commands: string[], cwd: string, home = ''): string
   return [...out].filter(p => p !== '/dev/null' && !p.endsWith('/dev/null'))
 }
 
+// Files the session's shell commands wrote to, where the command named them: a redirection
+// (> file, >> file), tee, or sed -i's file. Edits made inside a script's own code (a Python
+// heredoc writing a file) are not seen; git status in the project catches those.
+export function writtenPaths(commands: string[], cwd: string, home = ''): string[] {
+  const out = new Set<string>()
+  for (const cmd of commands) {
+    for (const m of cmd.matchAll(new RegExp(String.raw`(?:^|[^<>&\d])>{1,2}\s*${ARG}`, 'g'))) out.add(resolve(m[1] as string, cwd, home))
+    for (const m of cmd.matchAll(new RegExp(String.raw`\btee\s+(?:-a\s+)?${ARG}`, 'g'))) out.add(resolve(m[1] as string, cwd, home))
+    for (const m of cmd.matchAll(/\bsed\s+-i\b([^;&|]*)/g)) {
+      const words = (m[1] as string).trim().split(/\s+/).filter(Boolean)
+      const file = words[words.length - 1]
+      if (file && words.length >= 2) out.add(resolve(file, cwd, home))
+    }
+  }
+  return [...out].filter(p => !/\/dev\/(null|stderr|stdout)$/.test(p) && !/\/\d$/.test(p))
+}
+
+// `git status --porcelain` output → the changed paths in root.
+export function changedPaths(gitOut: string, root: string, max = 200): string[] {
+  return gitOut.split('\n').filter(l => l.length > 3)
+    .map(l => l.slice(3).trim().split(' -> ').pop() as string)
+    .map(l => l.replace(/^"(.*)"$/, '$1'))
+    .slice(0, max).map(l => `${root.replace(/\/$/, '')}/${l.replace(/\/$/, '')}`)
+}
+
 // Folders an install or build fills, when the project is not a git repository (which lists
 // what it ignores itself).
 export const SHARED_NAMES = ['node_modules', '.venv', 'venv', 'dist', 'build', 'target', '.next', '.nuxt', '.turbo', 'coverage', '__pycache__', '.pytest_cache', 'Pods', 'vendor', '.gradle']
@@ -149,6 +178,7 @@ export const LIFETIME = {
   scratch: 'the app\'s folder for this session: removed when you delete the session',
   worktree: 'a git worktree: stays until it is removed (its branch keeps the commits)',
   edited: 'files of your project the session changed: yours to keep, commit or discard with git',
+  uncommitted: 'changes in the project not yet committed, by any session: commit them or git takes them back',
   scratchpad: 'the app\'s temp folder for this session: cleared when the system clears its temp files',
   fetched: 'downloaded or cloned by a command the session ran: stays until you delete it',
   shared: 'dependencies and build output in the project, shared by every session on it: an install or build makes them again',

@@ -124,6 +124,8 @@ export const isSecretPath = (file: string) => SECRET.test(file)
 export const EVENTS_MAX = 1500
 export const EVENTS_FULL = 200
 const LEAN_DETAIL = 160
+// Commands keep more: the footprint reads what they downloaded and wrote to.
+const LEAN_COMMAND = 600
 
 export function trimEvents(list: ActivityEvent[], max = EVENTS_MAX, full = EVENTS_FULL): ActivityEvent[] {
   const kept = list.length > max ? list.slice(-max) : list
@@ -132,7 +134,8 @@ export function trimEvents(list: ActivityEvent[], max = EVENTS_MAX, full = EVENT
   return kept.map((ev, i) => {
     if (i >= cut) return ev
     const { diff: _diff, ...rest } = ev
-    return rest.detail && rest.detail.length > LEAN_DETAIL ? { ...rest, detail: `${rest.detail.slice(0, LEAN_DETAIL - 1)}…` } : rest
+    const keep = rest.kind === 'command' || rest.kind === 'test' ? LEAN_COMMAND : LEAN_DETAIL
+    return rest.detail && rest.detail.length > keep ? { ...rest, detail: `${rest.detail.slice(0, keep - 1)}…` } : rest
   })
 }
 

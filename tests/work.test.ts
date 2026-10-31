@@ -3,7 +3,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { Requirement } from '../types'
 import { filterReqs, findCheck, gapOf, humanText, linkStep, linker, planFrom, previewUrls, trimEvents } from '../hooks/work'
 import { parseReview, parseTagged } from '../hooks/tagging'
-import { cacheDirs, changedPaths, duKb, duLines, fetchedPaths, fmtKb, ignoredPaths, sumKb, treeRss, workspaceOf, writtenPaths } from '../hooks/footprint'
+import { cacheDirs, changedPaths, duKb, duLines, fetchedPaths, fmtKb, ignoredPaths, roleOf, sumKb, treeRss, workspaceOf, writtenPaths } from '../hooks/footprint'
 
 const req = (id: string, title: string, extra: Partial<Requirement> = {}): Requirement => ({
   id, title, status: 'captured', at: 1, history: [{ at: 1, text: title, kind: 'original', by: 'you' }], evidence: [], ...extra,
@@ -169,6 +169,8 @@ describe('footprint', () => {
     expect(workspaceOf('/Users/a/Library/Application Support/Claude/scratch-workspaces/x/y/scratch-1')?.kind).toBe('scratch')
     expect(workspaceOf('/Users/a/Projects/app/.claude/worktrees/fix-1')?.kind).toBe('worktree')
     expect(workspaceOf('/Users/a/Projects/app')).toBeUndefined()
+    expect(workspaceOf('/Users/a/conductor/workspaces/news/vienna')?.kind).toBe('worktree')
+    expect(workspaceOf('/Users/a/.cursor/worktrees/news/x')?.kind).toBe('worktree')
     expect(duKb('123456\t/some/path\n')).toBe(123456)
     expect([fmtKb(512), fmtKb(2048), fmtKb(3 * 1024 * 1024)]).toEqual(['512 KB', '2 MB', '3.0 GB'])
   })
@@ -201,6 +203,12 @@ describe('footprint', () => {
       'if [ $x -gt 3 ]; then echo big; fi',
     ], '/p', '/h')
     expect(got.sort()).toEqual(['/p/build.log', '/p/hooks/release.ts', '/p/logs/run log.txt', '/p/notes.txt'])
+  })
+  test('ignored content is dependencies an install remakes, or data only its maker has', () => {
+    expect(['/p/node_modules', '/p/.venv/', '/p/deps', '/p/_build', '/p/pkg.egg-info'].map(roleOf)).toEqual(['deps', 'deps', 'deps', 'deps', 'deps'])
+    expect(['/p/pipeline/jobs', '/p/.context', '/p/models'].map(roleOf)).toEqual(['data', 'data', 'data'])
+    expect(cacheDirs('/h', 'mac')).toContain('/h/.cache/torch')
+    expect(cacheDirs('/h', 'mac')).toContain('/h/Library/Caches/ms-playwright')
   })
   test('uncommitted changes come from git status, renames by their new name', () => {
     expect(changedPaths(' M hooks/a.ts\n?? new dir/\nR  old.ts -> new.ts\n', '/p')).toEqual(['/p/hooks/a.ts', '/p/new dir', '/p/new.ts'])

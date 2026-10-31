@@ -82,7 +82,8 @@ export type Footprint = {
   fetchedKb?: number
   fetched?: { path: string; kb: number }[]
   sharedKb?: number
-  shared?: { path: string; kb: number }[]
+  sharedDataKb?: number
+  shared?: { path: string; kb: number; role?: 'deps' | 'data' }[]
   cacheKb?: number
   caches?: { path: string; kb: number }[]
 }

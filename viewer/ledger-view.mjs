@@ -309,7 +309,7 @@ function sharedList() {
     const f = st.footprint
     if (!f) continue
     const key = st.cwd || projectOf(st)
-    if (f.shared?.length && (!byProject.has(key) || byProject.get(key).at < f.at)) byProject.set(key, { at: f.at, name: projectOf(st), kb: f.sharedKb || 0, items: f.shared })
+    if (f.shared?.length && (!byProject.has(key) || byProject.get(key).at < f.at)) byProject.set(key, { at: f.at, name: projectOf(st), kb: f.sharedKb || 0, dataKb: f.sharedDataKb || 0, items: f.shared })
     if (f.caches?.length && (!caches || caches.at < f.at)) caches = { at: f.at, kb: f.cacheKb || 0, items: f.caches }
   }
   return { projects: [...byProject.values()].sort((a, b) => b.kb - a.kb), caches }
@@ -407,8 +407,13 @@ function middleLines(w, withSignals) {
     })
     if (shared.projects.length || shared.caches) {
       lines.push([], [seg('SHARED', P.text2, undefined, true), seg('  counted once, not per session', P.text3)])
-      for (const pr of shared.projects) lines.push(...wrap(`${pr.name}: ${fmtKb(pr.kb)} of dependencies and build output (${pr.items.slice(0, 4).map(i => `${path.basename(i.path)} ${fmtKb(i.kb)}`).join(', ')}${pr.items.length > 4 ? ', …' : ''}). ${LIFETIME.shared}.`, w, P.text2))
-      if (shared.caches) lines.push(...wrap(`Package caches: ${fmtKb(shared.caches.kb)} (${shared.caches.items.slice(0, 4).map(i => `${i.path.replace(HOME, '~')} ${fmtKb(i.kb)}`).join(', ')}${shared.caches.items.length > 4 ? ', …' : ''}). ${LIFETIME.cache}.`, w, P.text2))
+      const named = items => `${items.slice(0, 4).map(i => `${path.basename(i.path)} ${fmtKb(i.kb)}`).join(', ')}${items.length > 4 ? ', …' : ''}`
+      for (const pr of shared.projects) {
+        const deps = pr.items.filter(i => i.role !== 'data'), data = pr.items.filter(i => i.role === 'data')
+        if (pr.kb - pr.dataKb > 0) lines.push(...wrap(`${pr.name}: ${fmtKb(pr.kb - pr.dataKb)} of dependencies and build output (${named(deps)}). ${LIFETIME.shared}.`, w, P.text2))
+        if (pr.dataKb) lines.push(...wrap(`${pr.name}: ${fmtKb(pr.dataKb)} of data (${named(data)}): ${LIFETIME.data}.`, w, P.warn))
+      }
+      if (shared.caches) lines.push(...wrap(`Caches: ${fmtKb(shared.caches.kb)} (${shared.caches.items.slice(0, 4).map(i => `${i.path.replace(HOME, '~')} ${fmtKb(i.kb)}`).join(', ')}${shared.caches.items.length > 4 ? ', …' : ''}). ${LIFETIME.cache}.`, w, P.text2))
     }
     lines.push([], ...wrap(`Own files are a session's transcript (~/.claude/projects, ${LIFETIME.transcript(keepDays)}), its ledger (~/.claude/principia, ${LIFETIME.ledger}), the project files it changed, its temp folder and what it downloaded. A folder is the session's own: ${LIFETIME.scratch}, or ${LIFETIME.worktree}. Sessions that ran before this version report only the first two.`, w, P.text3))
     lines.push([], ...wrap(backup.latest ? `Time Machine's last backup: ${backup.latest}. Nothing here is synced anywhere else.` : backup.checked ? 'No Time Machine backup found: these files exist on this computer only.' : 'Checking for a Time Machine backup…', w, backup.latest ? P.text3 : P.warn))
@@ -478,8 +483,9 @@ function detailLines(w) {
     }
     if (f.sharedKb) {
       lines.push([], [seg('Shared with every session on this project', P.text3)])
-      lines.push(...wrap(`${fmtKb(f.sharedKb)}: ${LIFETIME.shared}.`, w, P.text2, '  '))
-      for (const it of f.shared ?? []) lines.push(...wrap(`${it.path.replace(HOME, '~')} ${fmtKb(it.kb)}`, w, P.text3, '    '))
+      if (f.sharedKb - (f.sharedDataKb || 0) > 0) lines.push(...wrap(`${fmtKb(f.sharedKb - (f.sharedDataKb || 0))} dependencies and build output: ${LIFETIME.shared}.`, w, P.text2, '  '))
+      if (f.sharedDataKb) lines.push(...wrap(`${fmtKb(f.sharedDataKb)} data: ${LIFETIME.data}.`, w, P.warn, '  '))
+      for (const it of f.shared ?? []) lines.push(...wrap(`${it.path.replace(HOME, '~')} ${fmtKb(it.kb)}${it.role === 'data' ? ' · data' : ''}`, w, P.text3, '    '))
     }
     if (f.cacheKb) {
       lines.push([], [seg('Shared with everything on this computer', P.text3)])

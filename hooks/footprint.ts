@@ -28,16 +28,27 @@ export type Footprint = {
   // What the session's commands downloaded or cloned (curl -o, wget -O, git clone, gh …).
   fetchedKb?: number
   fetched?: Sized[]
-  // Shared by every session on the project: dependencies, build output and other content
-  // git ignores in the project folder (node_modules, .venv, dist…).
+  // Shared by every session on the project: what git ignores in the project folder. Each item
+  // is dependencies or build output (node_modules, .venv, dist…: an install or build makes them
+  // again) or data the project's own commands wrote (job output, model files: nothing remakes it).
   sharedKb?: number
+  sharedDataKb?: number
   shared?: Sized[]
   // Package caches shared by everything on this computer, which installs fill.
   cacheKb?: number
   caches?: Sized[]
 }
 
-export type Sized = { path: string; kb: number }
+export type Sized = { path: string; kb: number; role?: 'deps' | 'data' }
+
+const DEPS_NAMES = new Set([...['node_modules', '.venv', 'venv', 'dist', 'build', 'target', '.next', '.nuxt', '.turbo', 'coverage', '__pycache__', '.pytest_cache', 'Pods', 'vendor', '.gradle'],
+  'deps', '_build', '.gstack', '.mypy_cache', '.ruff_cache', '.cache', '.parcel-cache', '.eggs', 'bower_components', '.terraform', 'DerivedData', '.build', '.tox', '.svelte-kit', 'out', '.angular'])
+
+// Whether ignored content is remade by an install or build, or is data only its maker has.
+export const roleOf = (p: string): 'deps' | 'data' => {
+  const name = p.replace(/\/+$/, '').split('/').pop() ?? ''
+  return DEPS_NAMES.has(name) || /\.egg-info$/.test(name) ? 'deps' : 'data'
+}
 
 // `ps -axo pid=,ppid=,rss=` → the resident memory (KB) of `root` and every descendant.
 export function treeRss(ps: string, root: number): { procs: number; ramKb: number } {
@@ -68,6 +79,8 @@ export function treeRss(ps: string, root: number): { procs: number; ramKb: numbe
 export function workspaceOf(root: string): Footprint['workspace'] | undefined {
   if (/[\\/]scratch-workspaces[\\/]/.test(root)) return { path: root, kind: 'scratch' }
   if (/[\\/]\.claude[\\/]worktrees[\\/]/.test(root)) return { path: root, kind: 'worktree' }
+  // Other agents' worktrees sessions are opened in: Conductor's, Cursor's.
+  if (/[\\/]conductor[\\/]workspaces[\\/]/.test(root) || /[\\/]\.cursor[\\/]worktrees[\\/]/.test(root)) return { path: root, kind: 'worktree' }
   return undefined
 }
 
@@ -160,8 +173,8 @@ export function ignoredPaths(gitOut: string, root: string, max = 60): string[] {
 // Where installs leave what they download, for the whole computer.
 export const cacheDirs = (home: string, os: 'mac' | 'linux' | 'windows', extra: string[] = []): string[] => [
   `${home}/.bun/install/cache`, `${home}/.npm/_cacache`, `${home}/.cache/pip`, `${home}/.cache/uv`, `${home}/.cargo/registry`,
-  `${home}/.m2/repository`, `${home}/.cache/huggingface`, `${home}/.claude/plugins/cache`,
-  ...(os === 'mac' ? [`${home}/Library/Caches/pip`, `${home}/Library/Caches/uv`, `${home}/Library/Caches/Homebrew`, `${home}/Library/Caches/pypoetry`] : []),
+  `${home}/.m2/repository`, `${home}/.cache/huggingface`, `${home}/.cache/torch`, `${home}/.cache/ms-playwright`, `${home}/.gstack/chromium-profile`, `${home}/.claude/plugins/cache`,
+  ...(os === 'mac' ? [`${home}/Library/Caches/pip`, `${home}/Library/Caches/uv`, `${home}/Library/Caches/Homebrew`, `${home}/Library/Caches/pypoetry`, `${home}/Library/Caches/ms-playwright`] : []),
   ...extra,
 ]
 
@@ -182,7 +195,8 @@ export const LIFETIME = {
   scratchpad: 'the app\'s temp folder for this session: cleared when the system clears its temp files',
   fetched: 'downloaded or cloned by a command the session ran: stays until you delete it',
   shared: 'dependencies and build output in the project, shared by every session on it: an install or build makes them again',
-  cache: 'package caches shared by everything on this computer: the next install refills them',
+  data: 'written in the project by its own commands and ignored by git, so nothing remakes it: yours to judge before deleting',
+  cache: 'package, model and browser caches shared by everything on this computer: the next install or download refills them',
 } as const
 
 // The shell that finds the Claude Code process this hook runs in: walks up from the shell's

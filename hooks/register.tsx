@@ -23,7 +23,7 @@ import type { Complete, LedgerItem, PastPrompt, Progress, Tagged, Turn } from '.
 import { PLAN_TOOLS, REQ_FILTERS, failureText, filterReqs, findCheck, gapOf, humanText, isSecretPath, linker, planFrom, previewUrls, trimEvents } from './work'
 import type { ReqFilterName } from './work'
 import { RELEASE } from './release'
-import { FIND_SELF, SHARED_NAMES, cacheDirs, changedPaths, duKb, duLines, fetchedPaths, fmtKb, ignoredPaths, sumKb, treeRss, workspaceOf, writtenPaths } from './footprint'
+import { FIND_SELF, SHARED_NAMES, cacheDirs, changedPaths, duKb, duLines, fetchedPaths, fmtKb, ignoredPaths, roleOf, sumKb, treeRss, workspaceOf, writtenPaths } from './footprint'
 import type { Sized } from './footprint'
 import type { Footprint } from './footprint'
 import { EDITORS, LINUX, MAC, WINDOWS, base, firstLine, join, launchCommand, programName } from './platform'
@@ -885,7 +885,7 @@ async function measureFootprint($: $T, files: boolean) {
     // Dependencies and build output in the project: what git ignores there, or the usual folders.
     const gitIgnored = sessionRoot ? (await run($, ['git', '-C', sessionRoot, 'ls-files', '--others', '--ignored', '--exclude-standard', '--directory']))?.stdout : ''
     const sharedPaths = sessionRoot ? (gitIgnored ? ignoredPaths(gitIgnored, sessionRoot) : SHARED_NAMES.map(n => join(sessionRoot, n))) : []
-    const shared = await sizes(sharedPaths)
+    const shared = (await sizes(sharedPaths)).map(x => ({ ...x, role: roleOf(x.path) }))
     const caches = await sizes(cacheDirs(home, plat.os, [plat.tmp]))
     disk = {
       transcriptKb: transcript ? await size(transcript) : 0,
@@ -895,7 +895,7 @@ async function measureFootprint($: $T, files: boolean) {
       uncommittedKb: sumKb(uncommitted), uncommittedFiles: uncommitted.length,
       scratchKb: scratchLine?.kb ?? 0, scratch: scratchLine?.path,
       fetchedKb: sumKb(fetched), fetched: fetched.slice(0, 12),
-      sharedKb: sumKb(shared), shared: shared.slice(0, 8),
+      sharedKb: sumKb(shared), sharedDataKb: sumKb(shared.filter(x => x.role === 'data')), shared: shared.slice(0, 10),
       cacheKb: sumKb(caches), caches: caches.slice(0, 8),
     }
   }

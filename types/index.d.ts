@@ -75,6 +75,16 @@ export type Footprint = {
   ledgerKb: number
   workspaceKb: number
   workspace?: { path: string; kind: 'scratch' | 'worktree' }
+  editedKb?: number
+  editedFiles?: number
+  scratchKb?: number
+  scratch?: string
+  fetchedKb?: number
+  fetched?: { path: string; kb: number }[]
+  sharedKb?: number
+  shared?: { path: string; kb: number }[]
+  cacheKb?: number
+  caches?: { path: string; kb: number }[]
 }
 
 export type EventKind = 'discovery' | 'plan' | 'code' | 'command' | 'test' | 'message'

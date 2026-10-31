@@ -286,8 +286,24 @@ function footList() {
     const transcriptKb = sizeKb(transcriptOf.get(st.sessionId) ?? '') || f.transcriptKb || 0
     const ledgerKb = sizeKb(path.join(dir, `state-${st.sessionId}.json`))
     const workspaceKb = f.workspace ? f.workspaceKb || 0 : 0
-    return { st, live, ramKb: live ? f.ramKb || 0 : 0, procs: live ? f.procs || 0 : 0, transcriptKb, ledgerKb, workspaceKb, workspace: f.workspace, diskKb: transcriptKb + ledgerKb + workspaceKb }
+    const editedKb = f.editedKb || 0, scratchKb = f.scratchKb || 0, fetchedKb = f.fetchedKb || 0
+    return { st, live, f, ramKb: live ? f.ramKb || 0 : 0, procs: live ? f.procs || 0 : 0, transcriptKb, ledgerKb, workspaceKb, workspace: f.workspace,
+      editedKb, scratchKb, fetchedKb, diskKb: transcriptKb + ledgerKb + workspaceKb + editedKb + scratchKb + fetchedKb }
   }).sort((a, b) => (b.ramKb + b.diskKb) - (a.ramKb + a.diskKb))
+}
+// Shared by every session on a project (its dependencies and build output) and by the whole
+// computer (package caches): each counted once, from the newest measurement that has it.
+function sharedList() {
+  const byProject = new Map()
+  let caches = null
+  for (const st of sessionList()) {
+    const f = st.footprint
+    if (!f) continue
+    const key = st.cwd || projectOf(st)
+    if (f.shared?.length && (!byProject.has(key) || byProject.get(key).at < f.at)) byProject.set(key, { at: f.at, name: projectOf(st), kb: f.sharedKb || 0, items: f.shared })
+    if (f.caches?.length && (!caches || caches.at < f.at)) caches = { at: f.at, kb: f.cacheKb || 0, items: f.caches }
+  }
+  return { projects: [...byProject.values()].sort((a, b) => b.kb - a.kb), caches }
 }
 
 function reqLines(w) {
@@ -366,17 +382,26 @@ function middleLines(w, withSignals) {
   } else if (middle === 'footprint') {
     const list = footList()
     const ram = list.reduce((n, x) => n + x.ramKb, 0), disk = list.reduce((n, x) => n + x.diskKb, 0)
-    lines.push([seg('Memory ', P.text3), seg(fmtKb(ram), P.text, undefined, true), seg(' · on disk ', P.text3), seg(fmtKb(disk), P.text, undefined, true), seg(' · this computer only', P.text3)])
+    const shared = sharedList()
+    const sharedKb = shared.projects.reduce((n, x) => n + x.kb, 0) + (shared.caches?.kb || 0)
+    lines.push([seg('Memory ', P.text3), seg(fmtKb(ram), P.text, undefined, true), seg(' · sessions\' own files ', P.text3), seg(fmtKb(disk), P.text, undefined, true),
+      ...(sharedKb ? [seg(' · shared ', P.text3), seg(fmtKb(sharedKb), P.text, undefined, true)] : []), seg(' · this computer only', P.text3)])
     lines.push([])
     const cw = 9
-    lines.push([seg(' '.repeat(w - cw * 3 - 2)), seg('memory'.padStart(cw), P.text3), seg('on disk'.padStart(cw), P.text3), seg('folder'.padStart(cw), P.text3)])
+    lines.push([seg(' '.repeat(w - cw * 4 - 2)), seg('memory'.padStart(cw), P.text3), seg('own files'.padStart(cw), P.text3), seg('edited'.padStart(cw), P.text3), seg('folder'.padStart(cw), P.text3)])
     list.forEach((x, i) => {
-      const name = [...`${x.live ? (x.st.isWorking ? '● ' : '○ ') : '· '}${nameOf(x.st)}`].slice(0, w - cw * 3 - 3).join('')
-      lines.push({ sel: isSel('footprint', i), line: [seg(name.padEnd(w - cw * 3 - 2), x.live ? P.text : P.text3),
+      const name = [...`${x.live ? (x.st.isWorking ? '● ' : '○ ') : '· '}${nameOf(x.st)}`].slice(0, w - cw * 4 - 3).join('')
+      lines.push({ sel: isSel('footprint', i), line: [seg(name.padEnd(w - cw * 4 - 2), x.live ? P.text : P.text3),
         seg((x.live ? fmtKb(x.ramKb) : '–').padStart(cw), x.live ? P.active : P.text3), seg(fmtKb(x.diskKb).padStart(cw), P.text),
+        seg((x.f.editedFiles ? fmtKb(x.editedKb) : '–').padStart(cw), x.f.editedFiles ? P.text2 : P.text3),
         seg((x.workspace ? fmtKb(x.workspaceKb) : '–').padStart(cw), x.workspace ? P.warn : P.text3)] })
     })
-    lines.push([], ...wrap(`Transcripts (~/.claude/projects) are ${LIFETIME.transcript(keepDays)}. Ledgers (~/.claude/principia) are ${LIFETIME.ledger}. A folder is the session's own: ${LIFETIME.scratch}, or ${LIFETIME.worktree}.`, w, P.text3))
+    if (shared.projects.length || shared.caches) {
+      lines.push([], [seg('SHARED', P.text2, undefined, true), seg('  counted once, not per session', P.text3)])
+      for (const pr of shared.projects) lines.push(...wrap(`${pr.name}: ${fmtKb(pr.kb)} of dependencies and build output (${pr.items.slice(0, 4).map(i => `${path.basename(i.path)} ${fmtKb(i.kb)}`).join(', ')}${pr.items.length > 4 ? ', …' : ''}). ${LIFETIME.shared}.`, w, P.text2))
+      if (shared.caches) lines.push(...wrap(`Package caches: ${fmtKb(shared.caches.kb)} (${shared.caches.items.slice(0, 4).map(i => `${i.path.replace(HOME, '~')} ${fmtKb(i.kb)}`).join(', ')}${shared.caches.items.length > 4 ? ', …' : ''}). ${LIFETIME.cache}.`, w, P.text2))
+    }
+    lines.push([], ...wrap(`Own files are a session's transcript (~/.claude/projects, ${LIFETIME.transcript(keepDays)}), its ledger (~/.claude/principia, ${LIFETIME.ledger}), the project files it changed, its temp folder and what it downloaded. A folder is the session's own: ${LIFETIME.scratch}, or ${LIFETIME.worktree}. Sessions that ran before this version report only the first two.`, w, P.text3))
     lines.push([], ...wrap(backup.latest ? `Time Machine's last backup: ${backup.latest}. Nothing here is synced anywhere else.` : backup.checked ? 'No Time Machine backup found: these files exist on this computer only.' : 'Checking for a Time Machine backup…', w, backup.latest ? P.text3 : P.warn))
   } else if (middle === 'preview') {
     const list = previews()
@@ -435,6 +460,23 @@ function detailLines(w) {
     lines.push(...wrap(`Ledger ${fmtKb(x.ledgerKb)}: ${LIFETIME.ledger}.`, w, P.text2, '  '))
     if (x.workspace) lines.push(...wrap(`Folder ${fmtKb(x.workspaceKb)}: ${LIFETIME[x.workspace.kind]}.`, w, P.text2, '  '), ...wrap(x.workspace.path.replace(HOME, '~'), w, P.text3, '    '))
     else lines.push(...wrap('No folder of its own: it works in your project, which is yours to keep.', w, P.text2, '  '))
+    if (f.editedFiles !== undefined) lines.push(...wrap(`Edited ${fmtKb(x.editedKb)} in ${f.editedFiles} file${f.editedFiles === 1 ? '' : 's'}: ${LIFETIME.edited}.`, w, P.text2, '  '))
+    if (f.scratch) lines.push(...wrap(`Temp folder ${fmtKb(x.scratchKb)}: ${LIFETIME.scratchpad}.`, w, P.text2, '  '), ...wrap(f.scratch.replace(HOME, '~'), w, P.text3, '    '))
+    if (f.fetched?.length) {
+      lines.push(...wrap(`Downloaded ${fmtKb(x.fetchedKb)}: ${LIFETIME.fetched}.`, w, P.text2, '  '))
+      for (const it of f.fetched) lines.push(...wrap(`${it.path.replace(HOME, '~')} ${fmtKb(it.kb)}`, w, P.text3, '    '))
+    }
+    if (f.sharedKb) {
+      lines.push([], [seg('Shared with every session on this project', P.text3)])
+      lines.push(...wrap(`${fmtKb(f.sharedKb)}: ${LIFETIME.shared}.`, w, P.text2, '  '))
+      for (const it of f.shared ?? []) lines.push(...wrap(`${it.path.replace(HOME, '~')} ${fmtKb(it.kb)}`, w, P.text3, '    '))
+    }
+    if (f.cacheKb) {
+      lines.push([], [seg('Shared with everything on this computer', P.text3)])
+      lines.push(...wrap(`${fmtKb(f.cacheKb)}: ${LIFETIME.cache}.`, w, P.text2, '  '))
+      for (const it of f.caches ?? []) lines.push(...wrap(`${it.path.replace(HOME, '~')} ${fmtKb(it.kb)}`, w, P.text3, '    '))
+    }
+    if (f.editedFiles === undefined && f.at) lines.push(...wrap('Measured by an earlier version: project files it changed, its temp folder and downloads were not counted.', w, P.text3, '  '))
     lines.push([], ...wrap(backup.latest ? `Backed up by Time Machine as of ${backup.latest}; not synced anywhere else.` : 'On this computer only: not backed up, not synced.', w, backup.latest ? P.text2 : P.warn))
     if (f.at) lines.push([], [seg(`measured ${hhmm(f.at)}`, P.text3)])
     return lines

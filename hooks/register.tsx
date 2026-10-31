@@ -23,7 +23,8 @@ import type { Complete, LedgerItem, PastPrompt, Progress, Tagged, Turn } from '.
 import { PLAN_TOOLS, REQ_FILTERS, failureText, filterReqs, findCheck, gapOf, humanText, isSecretPath, linker, planFrom, previewUrls, trimEvents } from './work'
 import type { ReqFilterName } from './work'
 import { RELEASE } from './release'
-import { FIND_SELF, duKb, fmtKb, treeRss, workspaceOf } from './footprint'
+import { FIND_SELF, SHARED_NAMES, cacheDirs, duKb, duLines, fetchedPaths, fmtKb, ignoredPaths, sumKb, treeRss, workspaceOf } from './footprint'
+import type { Sized } from './footprint'
 import type { Footprint } from './footprint'
 import { EDITORS, LINUX, MAC, WINDOWS, base, firstLine, join, launchCommand, programName } from './platform'
 import type { Editor, OS, Platform, Terminal } from './platform'
@@ -394,9 +395,9 @@ async function openDiff($: $T, ev: ActivityEvent, how: string) {
 
 // ---------- the machine: OS, Node, editors, terminals ----------
 
-async function run($: $T, argv: string[]) {
+async function run($: $T, argv: string[], timeoutMs = 8000) {
   try {
-    return await $.process.run(argv, { timeoutMs: 8000 })
+    return await $.process.run(argv, { timeoutMs })
   } catch {
     return undefined
   }
@@ -857,21 +858,45 @@ async function measureFootprint($: $T, files: boolean) {
   if (!selfPid) selfPid = Number(firstLine((await run($, ['sh', '-c', FIND_SELF]))?.stdout)) || 0
   const ps = await run($, ['ps', '-axo', 'pid=,ppid=,rss='])
   const { procs, ramKb } = selfPid && ps?.stdout ? treeRss(ps.stdout, selfPid) : { procs: 0, ramKb: 0 }
-  let disk = { transcriptKb: prev?.transcriptKb ?? 0, ledgerKb: prev?.ledgerKb ?? 0, workspaceKb: prev?.workspaceKb ?? 0 }
+  const { at: _at, pid: _pid, procs: _procs, ramKb: _ram, ...kept } = prev ?? { transcriptKb: 0, ledgerKb: 0, workspaceKb: 0 }
+  let disk: Omit<Footprint, 'at' | 'pid' | 'procs' | 'ramKb'> = kept
   const workspace = workspaceOf(sessionRoot)
   if (files || !prev) {
     const size = async (p: string) => duKb((await run($, ['du', '-sk', p]))?.stdout ?? '')
+    // Several paths at once; ones that don't exist are left out rather than failing the rest.
+    const sizes = async (paths: string[]): Promise<Sized[]> => (paths.length ? duLines((await run($, ['sh', '-c', 'du -sk "$@" 2>/dev/null', 'sh', ...paths.slice(0, 200)], 60_000))?.stdout ?? '') : [])
     // The transcript's folder is named after the session's folder, by rules of the app's own.
     const transcript = firstLine((await run($, ['sh', '-c', 'ls "$1"/*/"$2".jsonl 2>/dev/null | head -1', 'sh', await projectsDir($), sessionId]))?.stdout)
+    const events = await read($, eventsA)
+    // Files this session wrote or changed, and what its commands downloaded, come from its activity.
+    const edited = [...new Set(events.filter(x => x.kind === 'code' && x.file && !isSecretPath(x.file)).map(x => x.file as string))]
+    const home = (await $.env.get('HOME')) || (await $.env.get('USERPROFILE')) || ''
+    const fetched = await sizes(fetchedPaths(events.filter(x => x.kind === 'command' || x.kind === 'test').map(x => x.detail ?? ''), sessionRoot, home))
+    // The app's temp folder for this session lives under the system's temp folder, by session id.
+    const scratch = (await run($, ['sh', '-c', 'd=$(find "/tmp/claude-$(id -u)" -maxdepth 2 -type d -name "$1" 2>/dev/null | head -1); [ -n "$d" ] && du -sk "$d"', 'sh', sessionId]))?.stdout ?? ''
+    const scratchLine = duLines(scratch)[0]
+    // Dependencies and build output in the project: what git ignores there, or the usual folders.
+    const gitIgnored = sessionRoot ? (await run($, ['git', '-C', sessionRoot, 'ls-files', '--others', '--ignored', '--exclude-standard', '--directory']))?.stdout : ''
+    const sharedPaths = sessionRoot ? (gitIgnored ? ignoredPaths(gitIgnored, sessionRoot) : SHARED_NAMES.map(n => join(sessionRoot, n))) : []
+    const shared = await sizes(sharedPaths)
+    const caches = await sizes(cacheDirs(home, plat.os, [plat.tmp]))
     disk = {
       transcriptKb: transcript ? await size(transcript) : 0,
       ledgerKb: await size(stateFile()),
       workspaceKb: workspace ? await size(workspace.path) : 0,
+      editedKb: sumKb(await sizes(edited)), editedFiles: edited.length,
+      scratchKb: scratchLine?.kb ?? 0, scratch: scratchLine?.path,
+      fetchedKb: sumKb(fetched), fetched: fetched.slice(0, 12),
+      sharedKb: sumKb(shared), shared: shared.slice(0, 8),
+      cacheKb: sumKb(caches), caches: caches.slice(0, 8),
     }
   }
   await update($, footprintA, () => ({ at: now(), pid: selfPid || undefined, procs, ramKb, ...disk, workspace }))
   await mirror($)
 }
+
+// What is this session's alone on disk: not the project's dependencies or the computer's caches.
+const ownKb = (f: Footprint) => f.transcriptKb + f.ledgerKb + f.workspaceKb + (f.editedKb ?? 0) + (f.scratchKb ?? 0) + (f.fetchedKb ?? 0)
 
 // ---------- themes ----------
 
@@ -1506,7 +1531,7 @@ export const register: Register = on => {
         </Text>
         {footprint && (
           <Text color={p.text3}>
-            {fmtKb(footprint.ramKb)} memory in {footprint.procs} process{footprint.procs === 1 ? '' : 'es'} · {fmtKb(footprint.transcriptKb + footprint.ledgerKb + footprint.workspaceKb)} on disk, local only · M in the window for details
+            {fmtKb(footprint.ramKb)} memory in {footprint.procs} process{footprint.procs === 1 ? '' : 'es'} · {fmtKb(ownKb(footprint))} on disk, local only{footprint.sharedKb ? ` · ${fmtKb(footprint.sharedKb)} shared on the project` : ''} · M in the window for details
           </Text>
         )}
       </Box>

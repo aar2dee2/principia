@@ -3,7 +3,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { Requirement } from '../types'
 import { filterReqs, findCheck, gapOf, humanText, linkStep, linker, planFrom, previewUrls, trimEvents } from '../hooks/work'
 import { parseReview, parseTagged } from '../hooks/tagging'
-import { duKb, fmtKb, treeRss, workspaceOf } from '../hooks/footprint'
+import { cacheDirs, duKb, duLines, fetchedPaths, fmtKb, ignoredPaths, sumKb, treeRss, workspaceOf } from '../hooks/footprint'
 
 const req = (id: string, title: string, extra: Partial<Requirement> = {}): Requirement => ({
   id, title, status: 'captured', at: 1, history: [{ at: 1, text: title, kind: 'original', by: 'you' }], evidence: [], ...extra,
@@ -170,6 +170,30 @@ describe('footprint', () => {
     expect(workspaceOf('/Users/a/Projects/app')).toBeUndefined()
     expect(duKb('123456\t/some/path\n')).toBe(123456)
     expect([fmtKb(512), fmtKb(2048), fmtKb(3 * 1024 * 1024)]).toEqual(['512 KB', '2 MB', '3.0 GB'])
+  })
+  test('several du results are read largest first and summed', () => {
+    const list = duLines('12\t/a/x\n4096\t/a/node_modules\n\n300\t/a/with space\n')
+    expect(list.map(x => x.path)).toEqual(['/a/node_modules', '/a/with space', '/a/x'])
+    expect(sumKb(list)).toBe(4408)
+  })
+  test('what commands downloaded or cloned is found where they named it', () => {
+    const got = fetchedPaths([
+      'curl -sSL -o dist/tool.tgz https://x/y && tar xf dist/tool.tgz',
+      'curl --output "/tmp/a b.zip" https://x; wget -O ~/Downloads/m.bin https://x/m',
+      'git clone https://github.com/o/repo.git && cd repo',
+      'git clone --depth 1 git@github.com:o/other.git vendor/other',
+      'gh repo clone o/third',
+      'gh release download v1 -D ./bins --pattern "*"',
+      'curl -o /dev/null -w "%{http_code}" https://x',
+      'ls -o something',
+    ], '/p', '/home/u')
+    expect(got).toEqual(['/p/dist/tool.tgz', '/tmp/a b.zip', '/home/u/Downloads/m.bin', '/p/repo', '/p/vendor/other', '/p/third', '/p/bins'])
+  })
+  test('ignored content comes from git, minus the OS litter', () => {
+    expect(ignoredPaths('node_modules/\n.DS_Store\ndist/\ndist/a.js\n.gstack/\n.gstack/x.log\n\nsrc/.DS_Store\n', '/p/')).toEqual(['/p/node_modules', '/p/dist', '/p/.gstack'])
+    expect(cacheDirs('/h', 'linux')).not.toContain('/h/Library/Caches/pip')
+    expect(cacheDirs('/h', 'mac', ['/tmp/principia'])).toContain('/h/Library/Caches/pip')
+    expect(cacheDirs('/h', 'mac', ['/tmp/principia'])).toContain('/tmp/principia')
   })
 })
 

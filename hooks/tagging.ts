@@ -1,12 +1,14 @@
 // Tagging a prompt into requirements. Pure, so the live check (scripts/live-check.mjs)
 // sends the model exactly what the mod sends.
 
-export type Tagged = { title: string; quote: string; refines: string | null; conflicts?: string | null; conflict_reason?: string; revisit?: string | null }
+export type Tagged = { title: string; quote: string; refines: string | null; conflicts?: string | null; conflict_reason?: string; revisit?: string | null; kind?: 'requirement' | 'step' }
 
 export const TAG_SYSTEM =
   'You split a developer\'s message to a coding agent into atomic, checkable requirements. ' +
-  'Reply with JSON only: {"items":[{"title":string,"quote":string,"refines":string|null,"conflicts":string|null,"conflict_reason":string}]}. ' +
+  'Reply with JSON only: {"items":[{"title":string,"quote":string,"kind":"requirement"|"step","refines":string|null,"conflicts":string|null,"conflict_reason":string}]}. ' +
   'title: imperative, at most 12 words. quote: the exact words from the message it comes from. ' +
+  'kind: "step" when the item is a one-off action in this session (run a command, commit, push, bump a version, create a release, open a window, start a new session, tell the user something, run an import once); ' +
+  '"requirement" when it describes a lasting property of the product or the work (what it does, shows, stores, how it behaves, what must never happen). ' +
   'refines: the id of an existing requirement ONLY when this message explicitly revises that same requirement (same feature, new detail or correction). ' +
   'A different feature is a new item (refines null), even when it is related or touches the same screen. When in doubt, refines is null. ' +
   'conflicts: the id of an existing requirement this message contradicts (asks for the opposite, or for something both cannot be true at once), else null; ' +
@@ -37,7 +39,7 @@ export function parseTagged(reply: string): Tagged[] {
   try {
     const json = reply.slice(reply.indexOf('{'), reply.lastIndexOf('}') + 1)
     const items = (JSON.parse(json) as { items?: Tagged[] }).items ?? []
-    return items.filter(i => typeof i.title === 'string' && i.title.trim())
+    return items.filter(i => typeof i.title === 'string' && i.title.trim()).map(i => ({ ...i, kind: i.kind === 'step' ? 'step' as const : 'requirement' as const }))
   } catch {
     return []
   }
@@ -219,24 +221,32 @@ function progressFrom(raw: unknown): Progress[] {
 
 // ---------- after each turn: what the agent found, and whether it went against a requirement ----------
 
+export type OnYou = { text: string; kind: 'decision' | 'blocker' | 'manual'; id?: string }
 export type TurnReview = {
   findings: { text: string }[]
   conflicts: { id: string; reason: string }[]
   progress: Progress[]
+  // What the agent said only the person can do: a decision to make, something blocking on
+  // them (run a command, grant access), or a check by hand.
+  onYou: OnYou[]
 }
 
 export const REVIEW_SYSTEM =
   'You review a coding agent\'s report to its user for things the user would want to act on and might miss in a long chat. ' +
-  'Reply with JSON only: {"findings":[{"text":string}],"conflicts":[{"id":string,"reason":string}],"progress":[{"id":string,"status":string,"why":string}]}. ' +
-  'findings: at most 4, each one sentence: something new, surprising or unexpected the agent discovered (a bug elsewhere, a wrong assumption, ' +
-  'a risky state, data loss, a limitation it hit, a decision it made that the user did not ask for, something it could not do). ' +
-  'Not findings: routine progress ("I edited X", "tests pass"), plans, or restating the request. ' +
-  'conflicts: requirements (by id) that what the agent did or decided goes against, with a one-sentence reason. ' +
+  'Reply with JSON only: {"findings":[{"text":string}],"on_you":[{"text":string,"kind":"decision"|"blocker"|"manual","id":string|null}],"conflicts":[{"id":string,"reason":string}],"progress":[{"id":string,"status":string,"why":string}]}. ' +
+  'findings: at most 3, each one sentence, ONLY: a failure or error the agent hit, data lost or at risk, a part of what was asked that it skipped or left undone, ' +
+  'or a decision it made on its own that changes what the user asked for. ' +
+  'Not findings: how the agent worked (how many times it did something, what it cited, how it measured), its reasoning or caveats, routine progress, plans, or restating the request. ' +
+  'on_you: what the report says only the user can do, each one sentence with the requirement id when there is one: "decision" (a choice the agent asks the user to make), ' +
+  '"blocker" (something the user must run, grant, provide or approve before work can go on or ship, such as a command the agent is not allowed to run), ' +
+  '"manual" (a check the user should do by hand). Only what the report states; never invent one. ' +
+  'conflicts: requirements (by id) that what the agent did goes against, with a one-sentence reason. The user\'s own words are what was asked: a question the user asked ' +
+  '("why is X?") is not an instruction to change X, and a rename, removal or substitution the user asked for is not a conflict with the old wording. ' +
   'progress: requirements whose status this turn changed, judged from the report and the work list: "in_progress" (worked on, not finished), ' +
   '"implemented" (finished, or the agent says it is done), "blocked" (it could not), "needs_clarification" (it is waiting on the user). ' +
   'Use the developer\'s message that started the turn to see which requirements the turn was about. A summary, audit or status report in the reply that says items are done ' +
   '(or blocked, or waiting) counts for EVERY requirement it covers, not just the latest one. Include each requirement whose status should change; never "verified". why: one short sentence. ' +
-  'Reply {"findings":[],"conflicts":[],"progress":[]} when there is nothing.'
+  'Reply {"findings":[],"on_you":[],"conflicts":[],"progress":[]} when there is nothing.'
 
 export function reviewPrompt(reqs: { id: string; title: string; status?: string }[], answer: string, work: string[] = [], ask = ''): string {
   const list = reqs.length ? reqs.map(r => `${r.id}${r.status ? ` [${r.status}]` : ''}: ${r.title}`).join('\n') : '(none)'
@@ -248,13 +258,65 @@ export function reviewPrompt(reqs: { id: string; title: string; status?: string 
 export function parseReview(reply: string): TurnReview {
   try {
     const json = reply.slice(reply.indexOf('{'), reply.lastIndexOf('}') + 1)
-    const r = JSON.parse(json) as Partial<TurnReview>
+    const r = JSON.parse(json) as Partial<TurnReview> & { on_you?: { text?: unknown; kind?: unknown; id?: unknown }[] }
+    const onYou: OnYou[] = (Array.isArray(r.on_you) ? r.on_you : [])
+      .filter(o => typeof o?.text === 'string' && (o.text as string).trim() && ['decision', 'blocker', 'manual'].includes(String(o?.kind)))
+      .map(o => ({ text: (o.text as string).trim(), kind: o.kind as OnYou['kind'], id: typeof o.id === 'string' && /^R\d+$/.test(o.id) ? o.id : undefined }))
     return {
-      findings: (r.findings ?? []).filter(f => typeof f?.text === 'string' && f.text.trim()).slice(0, 4),
+      findings: (r.findings ?? []).filter(f => typeof f?.text === 'string' && f.text.trim()).slice(0, 3),
       conflicts: (r.conflicts ?? []).filter(c => typeof c?.id === 'string' && typeof c?.reason === 'string'),
       progress: progressFrom(r.progress),
+      onYou,
     }
   } catch {
-    return { findings: [], conflicts: [], progress: [] }
+    return { findings: [], conflicts: [], progress: [], onYou: [] }
+  }
+}
+
+// ---------- research and writing: an audit by another model ----------
+
+export type AuditItem = { id: string; cleared: boolean; note: string }
+
+export const AUDIT_SYSTEM =
+  'You are an adversarial auditor of research and writing produced by an AI agent. For each item you are given the claim (what the user asked for) ' +
+  'and the agent\'s answer with the sources it attached. Find gaps, misattributions, unsupported claims, numbers without a source, sources that do not say what is claimed, ' +
+  'and parts of the ask left unanswered. Be strict: an item is cleared only when every factual claim in the answer is supported by an attached source and the ask is fully answered. ' +
+  'Reply with JSON only: {"items":[{"id":string,"cleared":boolean,"note":string}]}. note: one or two sentences naming the gap, or what was checked when cleared.'
+
+export function auditPrompt(items: { id: string; title: string; sources: string[]; answer: string }[]): string {
+  return items.map(it => `### ${it.id}: ${it.title}\nSources attached:\n${it.sources.length ? it.sources.map(s => `- ${s}`).join('\n') : '(none)'}\n\nThe agent's answer:\n${it.answer.slice(-5000)}`).join('\n\n')
+}
+
+export function parseAudit(reply: string): AuditItem[] {
+  try {
+    const json = reply.slice(reply.indexOf('{'), reply.lastIndexOf('}') + 1)
+    const items = (JSON.parse(json) as { items?: Partial<AuditItem>[] }).items ?? []
+    return items.filter(i => typeof i.id === 'string' && typeof i.cleared === 'boolean').map(i => ({ id: i.id as string, cleared: i.cleared as boolean, note: String(i.note ?? '') }))
+  } catch {
+    return []
+  }
+}
+
+// ---------- the files a session created: what each is for ----------
+
+export type FileNote = { path: string; why: string; contains: string; use: string }
+
+export const FILES_SYSTEM =
+  'You describe files an AI coding agent created during a work session, for the person it works for. For each file you get its path, the start of its contents, ' +
+  'and the message the person had sent when it was created. Reply with JSON only: {"files":[{"path":string,"why":string,"contains":string,"use":string}]}. ' +
+  'why: why it was created, one short sentence. contains: what is in it, one short sentence (say "binary" or "empty" when so). ' +
+  'use: what it is for in this session now: "part of the product", "a test", "a one-off script", "scratch output", "a report for the person", "a download", "unknown". Plain words, no speculation beyond the contents.'
+
+export function filesPrompt(files: { path: string; head: string; ask: string }[]): string {
+  return files.map(f => `### ${f.path}\nMessage at the time: ${f.ask.slice(0, 400) || '(none)'}\nContents start:\n${f.head.slice(0, 1600)}`).join('\n\n')
+}
+
+export function parseFiles(reply: string): FileNote[] {
+  try {
+    const json = reply.slice(reply.indexOf('{'), reply.lastIndexOf('}') + 1)
+    const items = (JSON.parse(json) as { files?: Partial<FileNote>[] }).files ?? []
+    return items.filter(i => typeof i.path === 'string').map(i => ({ path: i.path as string, why: String(i.why ?? ''), contains: String(i.contains ?? ''), use: String(i.use ?? '') }))
+  } catch {
+    return []
   }
 }

@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import type { Requirement } from '../types'
-import { filterReqs, findCheck, gapOf, humanText, linkStep, linker, planFrom, previewUrls, trimEvents } from '../hooks/work'
-import { parseReview, parseTagged } from '../hooks/tagging'
+import { filterReqs, findCheck, gapOf, guardOf, humanText, lastShip, linkStep, linker, planFrom, previewUrls, sessionKind, shipGate, trimEvents } from '../hooks/work'
+import { parseAudit, parseFiles, parseReview, parseTagged } from '../hooks/tagging'
 import { appDirs, appRss, cacheDirs, changedPaths, duKb, duLines, fetchedPaths, fmtKb, ignoredPaths, roleOf, sumKb, treeRss, workspaceOf, writtenPaths } from '../hooks/footprint'
 
 const req = (id: string, title: string, extra: Partial<Requirement> = {}): Requirement => ({
@@ -44,7 +44,7 @@ describe('signals and previews', () => {
     const r = parseReview('{"findings":[{"text":"The cache is shared across users"}],"conflicts":[{"id":"R2","reason":"wrote to /tmp"}]}')
     expect(r.findings.length).toBe(1)
     expect(r.conflicts[0]?.id).toBe('R2')
-    expect(parseReview('not json')).toEqual({ findings: [], conflicts: [], progress: [] })
+    expect(parseReview('not json')).toEqual({ findings: [], conflicts: [], progress: [], onYou: [] })
   })
   test('the tagger can flag a conflict', async () => {
     const t = parseTagged('{"items":[{"title":"Remove search","quote":"drop search","refines":null,"conflicts":"R3","conflict_reason":"R3 adds search"}]}')
@@ -278,5 +278,53 @@ describe('findCheck', () => {
   test('a passing run before a later edit does not count, one after it does', () => {
     const got = findCheck([ev('b0', 'test', 500, 'bun test', 'ok'), edit, ev('b1', 'test', 1500, 'bun test', 'ok')], 'bun test')
     expect('pass' in got && got.pass.id).toBe('b1')
+  })
+})
+
+describe('regression guard, session kind, shipping', () => {
+  const ev = (id: string, kind: 'code' | 'test' | 'command' | 'discovery' | 'message', at: number, extra: Partial<{ detail: string; state: 'ok' | 'failed'; file: string; title: string }> = {}) =>
+    ({ id, kind, at, title: extra.title ?? id, ...extra })
+  test('the guard counts edits after the last passing test, including shell writes', () => {
+    const events = [ev('t1', 'test', 100, { detail: 'bun test', state: 'ok' }), ev('e1', 'code', 200, { file: '/p/a.ts' }), ev('c1', 'command', 300, { detail: 'echo x > out.txt', state: 'ok' }), ev('c2', 'command', 310, { detail: 'ls -la', state: 'ok' })]
+    const g = guardOf(events)
+    expect(g?.editsSince).toBe(2)
+    expect(g?.command).toBe('bun test')
+    expect(g?.edited).toEqual(['a.ts', 'c1'])
+    expect(guardOf([ev('t1', 'test', 100, { detail: 'bun test', state: 'ok' })])?.editsSince).toBe(0)
+    expect(guardOf([ev('d', 'discovery', 1)])).toBeUndefined()
+  })
+  test('a session is code, research or writing by what it did', () => {
+    expect(sessionKind([ev('e1', 'code', 1), ev('e2', 'code', 2), ev('t', 'test', 3)])).toBe('code')
+    expect(sessionKind([ev('w1', 'discovery', 1, { title: 'https://x' }), ev('w2', 'discovery', 2, { title: 'nuclear fleet age' }), ev('r', 'discovery', 3, { title: 'Read notes.md' })])).toBe('research')
+    expect(sessionKind([ev('m', 'message', 1)])).toBe('writing')
+  })
+  test('the last ship is the last passing release, push or deploy', () => {
+    const events = [ev('a', 'command', 1, { detail: 'git push origin main', state: 'ok' }), ev('b', 'command', 2, { detail: 'gh release create v1 --target main', state: 'failed' }), ev('c', 'command', 3, { detail: 'ls', state: 'ok' })]
+    expect(lastShip(events)?.command).toBe('git push origin main')
+    expect(lastShip([ev('c', 'command', 3, { detail: 'ls', state: 'ok' })])).toBeUndefined()
+  })
+  test('the ship gate separates first-version work, later work, and what waits on you', () => {
+    const reqs = [req('R1', 'Core flow', { status: 'in_progress' }), req('R2', 'Nice colours', { status: 'captured', ship: 'later' }), req('R3', 'Commit', { status: 'captured', step: true }), req('R4', 'Export', { status: 'implemented' }), req('R5', 'Done', { status: 'verified' })]
+    const gate = shipGate(reqs, [{ kind: 'blocker', text: 'Run gh release create' }, { kind: 'finding', text: 'x' }, { kind: 'decision', text: 'y', resolvedAt: 1 }])
+    expect(gate.first.map(r => r.id)).toEqual(['R1', 'R4'])
+    expect(gate.later.map(r => r.id)).toEqual(['R2'])
+    expect(gate.unverified.map(r => r.id)).toEqual(['R4'])
+    expect(gate.onYou.map(s => s.text)).toEqual(['Run gh release create'])
+  })
+  test('steps are hidden from every filter but their own', () => {
+    const reqs = [req('R1', 'Wrap text'), req('R2', 'Commit it', { step: true })]
+    expect(filterReqs(reqs, '', 'all').map(r => r.id)).toEqual(['R1'])
+    expect(filterReqs(reqs, '', 'steps').map(r => r.id)).toEqual(['R2'])
+    expect(filterReqs([req('R3', 'Later', { ship: 'later' }), req('R4', 'Now')], '', 'first').map(r => r.id)).toEqual(['R4'])
+    // Untagged (older) requirements: wording decides; a tag always wins.
+    expect(filterReqs([req('R5', 'Commit the changes on the current branch'), req('R6', 'Bump the version to 0.3.8'), req('R7', 'Wrap text in the column'), req('R8', 'Push notifications to users', { step: false }),
+      req('R9', 'Run audits twice a week'), req('R10', 'Install by pasting a few lines into Claude Code'), req('R11', 'Run the build script')], '', 'all').map(r => r.id)).toEqual(['R7', 'R8', 'R9', 'R10'])
+  })
+  test('tagging marks steps, the review keeps what is on you, audits and file notes parse', () => {
+    expect(parseTagged('{"items":[{"title":"Commit it","quote":"commit","kind":"step","refines":null},{"title":"Wrap text","quote":"wrap","refines":null}]}').map(t => t.kind)).toEqual(['step', 'requirement'])
+    const r = parseReview('{"findings":[],"on_you":[{"text":"Run the release command","kind":"blocker","id":"R15"},{"text":"bad","kind":"nope"}],"conflicts":[],"progress":[]}')
+    expect(r.onYou).toEqual([{ text: 'Run the release command', kind: 'blocker', id: 'R15' }])
+    expect(parseAudit('{"items":[{"id":"R2","cleared":false,"note":"no source for the 40% figure"}]}')).toEqual([{ id: 'R2', cleared: false, note: 'no source for the 40% figure' }])
+    expect(parseFiles('{"files":[{"path":"/p/x.md","why":"a report","contains":"notes","use":"a report for the person"}]}')[0]?.use).toBe('a report for the person')
   })
 })

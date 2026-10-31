@@ -13,14 +13,16 @@ import type {
   ReqFilter,
   ReqStatus,
   Requirement,
+  SessionFile,
   Signal,
   SignalKind,
   Theme,
+  Usage,
   View,
 } from '../types'
-import { REVIEW_SYSTEM, TAG_SYSTEM, buildLedger, judgeStatuses, parseReview, parseTagged, reviewPrompt, tagPrompt, turnsAsConversation } from './tagging'
+import { AUDIT_SYSTEM, FILES_SYSTEM, REVIEW_SYSTEM, TAG_SYSTEM, auditPrompt, buildLedger, filesPrompt, judgeStatuses, parseAudit, parseFiles, parseReview, parseTagged, reviewPrompt, tagPrompt, turnsAsConversation } from './tagging'
 import type { Complete, LedgerItem, PastPrompt, Progress, Tagged, Turn } from './tagging'
-import { PLAN_TOOLS, REQ_FILTERS, failureText, filterReqs, findCheck, gapOf, humanText, isSecretPath, linker, planFrom, previewUrls, trimEvents } from './work'
+import { PLAN_TOOLS, REQ_FILTERS, failureText, filterReqs, findCheck, gapOf, guardOf, humanText, isSecretPath, isStep, lastShip, linker, planFrom, previewUrls, sessionKind, shipGate, trimEvents } from './work'
 import type { ReqFilterName } from './work'
 import { RELEASE } from './release'
 import { FIND_SELF, SHARED_NAMES, appDirs, appRss, cacheDirs, changedPaths, duKb, duLines, fetchedPaths, fmtKb, ignoredPaths, roleOf, sumKb, treeRss, workspaceOf, writtenPaths } from './footprint'
@@ -68,6 +70,8 @@ const drawnA = atom({ plugin: 'principia', key: 'drawn' } as const, false)
 const turnsA = atom({ plugin: 'principia', key: 'turns' } as const, [] as Turn[])
 // What this session costs the computer: memory held now, files left behind (see footprint.ts).
 const footprintA = atom({ plugin: 'principia', key: 'footprint' } as const, undefined as Footprint | undefined)
+const usageA = atom({ plugin: 'principia', key: 'usage' } as const, undefined as Usage | undefined)
+const filesA = atom({ plugin: 'principia', key: 'files' } as const, [] as SessionFile[])
 const CONSOLIDATE_EVERY = 6
 
 const STATUS: Record<ReqStatus, { label: string; tone: Tone }> = {
@@ -141,6 +145,9 @@ async function mirror($: $T) {
     ])
     const turns = await read($, turnsA)
     const footprint = await read($, footprintA)
+    const usage = await read($, usageA)
+    const files = await read($, filesA)
+    const allTime = (await $.store.get('usage').catch(() => undefined)) as Usage | undefined
     // Work that finishes after the session has gone (a review still running when you quit) sees
     // empty state; writing that would wipe the ledger, so an empty ledger never replaces a full one.
     if (!reqs.length && !events.length) {
@@ -149,6 +156,7 @@ async function mirror($: $T) {
     }
     await $.fs.write(stateFile(), JSON.stringify({
       sessionId, project, cwd: sessionRoot, footprint, title, hasEnded, entry, drawn, turns: turns.slice(-400),
+      guard: guardOf(events), kind: sessionKind(events), ship: lastShip(events), usage, allTimeUsage: allTime, files,
       reqs, replies, events: trimEvents(events), signals: signals.slice(-100), plan, previews,
       isWorking: Boolean(turnId) && !hasEnded, editors: plat.editors, snapDir: join(plat.data, 'snapshots'), theme, dark: view.dark, at: now(),
       transcriptsAllowed: await transcriptsAllowed($),
@@ -191,10 +199,60 @@ async function addSignal($: $T, kind: SignalKind, text: string, link: Pick<Signa
   await mirror($)
 }
 
+// ---------- Principia's own model use ----------
+
+// Every model call Principia makes is counted, per session and for all sessions together (in
+// the plugin's shared store), so its own cost is in the open. Token counts come from the
+// result when it reports them, else from the text (about four characters a token).
+type CompleteResult = { isAnswered: boolean; text?: string; usage?: Record<string, number> }
+async function tally($: $T, purpose: string, sent: string, res: CompleteResult) {
+  const u = res.usage ?? {}
+  const reported = u.inputTokens ?? u.input_tokens
+  const tokensIn = reported ?? Math.ceil(sent.length / 4)
+  const tokensOut = u.outputTokens ?? u.output_tokens ?? Math.ceil((res.text ?? '').length / 4)
+  const add = (x: Usage | undefined): Usage => ({
+    calls: (x?.calls ?? 0) + 1, tokensIn: (x?.tokensIn ?? 0) + tokensIn, tokensOut: (x?.tokensOut ?? 0) + tokensOut,
+    estimated: (x?.estimated ?? false) || reported === undefined, since: x?.since ?? now(),
+    byPurpose: { ...(x?.byPurpose ?? {}), [purpose]: ((x?.byPurpose ?? {})[purpose] ?? 0) + 1 },
+  })
+  await update($, usageA, add)
+  try {
+    const all = (await $.store.get('usage')) as Usage | undefined
+    await $.store.set('usage', add(all))
+  } catch {
+    // the shared total is best effort
+  }
+}
+
 // What the agent did in a turn, as short lines for the review.
 const workOf = (events: ActivityEvent[], since: number) => events
   .filter(ev => ev.at >= since && (ev.kind === 'code' || ev.kind === 'test' || ev.kind === 'command'))
   .map(ev => `${KIND[ev.kind].label}: ${ev.title}${ev.state === 'failed' ? ' (failed)' : ev.kind === 'test' && ev.state === 'ok' ? ' (passed)' : ''}`)
+
+// Two sentences about the same thing: most of their words in common.
+function similar(a: string, b: string): boolean {
+  const words = (t: string) => new Set(t.toLowerCase().split(/\W+/).filter(w => w.length > 3))
+  const A = words(a), B = words(b)
+  if (!A.size || !B.size) return false
+  const common = [...A].filter(w => B.has(w)).length
+  return common / Math.min(A.size, B.size) >= 0.6
+}
+
+// A signal is over when its requirement moved on (verified, done for now, deferred), or, for a
+// finding with no requirement, after three further turns: nobody acts on week-old commentary.
+async function resolveSignals($: $T, movedIds: string[]) {
+  const reqs = await read($, reqsA)
+  const turns = (await read($, turnsA)).length
+  const settled = new Set(reqs.filter(r => r.status === 'verified' || r.status === 'revisit' || r.status === 'deferred').map(r => r.id))
+  const turnAt = (await read($, turnsA)).slice(-3)[0]?.at ?? 0
+  await update($, signalsA, list => list.map(s => {
+    if (s.dismissed || s.resolvedAt) return s
+    if (s.reqId && settled.has(s.reqId)) return { ...s, resolvedAt: now() }
+    if (s.reqId && s.kind === 'conflict' && movedIds.includes(s.reqId) && reqs.find(r => r.id === s.reqId)?.conflict === undefined) return { ...s, resolvedAt: now() }
+    if (s.kind === 'finding' && !s.reqId && turns >= 3 && s.at < turnAt) return { ...s, resolvedAt: now() }
+    return s
+  }))
+}
 
 async function consolidate($: $T) {
   try {
@@ -233,14 +291,22 @@ async function applyProgress($: $T, progress: Progress[], from: string): Promise
 async function review($: $T, answer: string, eventId: string, work: string[], ask: string): Promise<string[]> {
   try {
     const reqs = (await read($, reqsA)).filter(r => r.status !== 'deferred')
-    const res = await $.model.complete({ model: HAIKU, system: REVIEW_SYSTEM, prompt: reviewPrompt(reqs, answer, work, ask), maxTokens: 2000 })
+    const prompt = reviewPrompt(reqs, answer, work, ask)
+    const res = await $.model.complete({ model: HAIKU, system: REVIEW_SYSTEM, prompt, maxTokens: 2000 })
+    await tally($, 'review', REVIEW_SYSTEM + prompt, res)
     if (!res.isAnswered) return []
-    const { findings, conflicts: against, progress } = parseReview(res.text)
+    const { findings, conflicts: against, progress, onYou } = parseReview(res.text)
     await applyProgress($, progress, "Judged from the agent's report")
+    await resolveSignals($, progress.map(p => p.id))
     const context = { ask: clip(ask, 600), did: work.slice(-8).join('\n'), output: clip(answer, 800) }
-    for (const f of findings) await addSignal($, 'finding', f.text, { eventId, context })
+    const open = (await read($, signalsA)).filter(s => !s.dismissed && !s.resolvedAt)
+    const seen = (kind: SignalKind, reqId?: string, text?: string) =>
+      open.some(s => s.kind === kind && ((reqId && s.reqId === reqId) || (text && similar(s.text, text))))
+    for (const f of findings) if (!seen('finding', undefined, f.text)) await addSignal($, 'finding', f.text, { eventId, context })
+    // What only the person can do is the inbox: each item once, however many turns repeat it.
+    for (const o of onYou) if (!seen(o.kind, o.id, o.text)) await addSignal($, o.kind, o.text, { eventId, reqId: o.id, context })
     for (const c of against) {
-      if (!reqs.some(r => r.id === c.id)) continue
+      if (!reqs.some(r => r.id === c.id) || seen('conflict', c.id)) continue
       await update($, reqsA, (list): Requirement[] => list.map(r => (r.id === c.id ? { ...r, conflict: { reason: c.reason, at: now(), source: 'agent' } } : r)))
       await addSignal($, 'conflict', `The agent's work goes against ${c.id}: ${c.reason}`, { eventId, reqId: c.id, context })
     }
@@ -265,7 +331,9 @@ async function linkTurn($: $T, since: number, until: number, ids: string[]) {
 
 async function tag($: $T, text: string, reqs: Requirement[]): Promise<Tagged[]> {
   const lastReply = [...(await read($, eventsA))].reverse().find(ev => ev.kind === 'message')?.detail ?? ''
-  const res = await $.model.complete({ model: HAIKU, system: TAG_SYSTEM, prompt: tagPrompt(reqs, text, lastReply), maxTokens: 2000 })
+  const prompt = tagPrompt(reqs, text, lastReply)
+  const res = await $.model.complete({ model: HAIKU, system: TAG_SYSTEM, prompt, maxTokens: 2000 })
+  await tally($, 'tagging', TAG_SYSTEM + prompt, res)
   return res.isAnswered ? parseTagged(res.text) : []
 }
 
@@ -304,8 +372,9 @@ async function capture($: $T, text: string): Promise<string[]> {
         touched.push(`${target.id} (refined): ${t.title}`)
       } else {
         const id = nextId(out)
-        out = [...out, { id, title: t.title, status: 'captured', at: now(), history: [version], evidence: [] }]
-        touched.push(`${id}: ${t.title}`)
+        const step = t.kind === 'step'
+        out = [...out, { id, title: t.title, status: 'captured', at: now(), history: [version], evidence: [], ...(step ? { step: true } : {}) }]
+        touched.push(`${id}${step ? ' (step)' : ''}: ${t.title}`)
       }
     }
     return out
@@ -368,9 +437,44 @@ async function snapshot($: $T, ev: ActivityEvent) {
     const exists = await $.fs.exists(ev.file)
     const text = exists ? String(await $.fs.read(ev.file)) : ''
     await $.fs.write(snapOf(ev), text)
+    // A file that did not exist before this call is one the session created.
+    if (!exists) await update($, filesA, list => (list.some(f => f.path === ev.file) ? list : [...list, { path: ev.file as string, at: ev.at, kind: 'written' as const, eventId: ev.id }].slice(-300)))
   } catch {
     // no snapshot: the diff button falls back to opening the file
   }
+}
+
+// ---------- the files a session created, and what each is for ----------
+
+// Once every files pass, the files created since the last description are read (their first
+// lines) and described in one Haiku call: why each was made, what it holds, what it is for now.
+async function describeFiles($: $T) {
+  const files = await read($, filesA)
+  const todo = files.filter(f => f.why === undefined).slice(0, 8)
+  if (!todo.length) return
+  const turns = await read($, turnsA)
+  const askAt = (at: number) => [...turns].reverse().find(t => t.at <= at)?.ask ?? ''
+  const heads: { path: string; head: string; ask: string }[] = []
+  for (const f of todo) {
+    let head = ''
+    try {
+      const text = isSecretPath(f.path) ? '' : String(await $.fs.read(f.path))
+      head = /[\x00-\x08]/.test(text.slice(0, 2000)) ? '(binary)' : text.split('\n').slice(0, 40).join('\n')
+    } catch {
+      head = '(could not be read; it may have been deleted)'
+    }
+    heads.push({ path: f.path, head, ask: askAt(f.at) })
+  }
+  const prompt = filesPrompt(heads)
+  const res = await $.model.complete({ model: HAIKU, system: FILES_SYSTEM, prompt, maxTokens: 1500 })
+  await tally($, 'files', FILES_SYSTEM + prompt, res)
+  const notes = res.isAnswered ? parseFiles(res.text) : []
+  await update($, filesA, list => list.map(f => {
+    const n = notes.find(x => x.path === f.path || base(x.path) === base(f.path))
+    if (!todo.some(t => t.path === f.path)) return f
+    // Described, or marked as tried, so one unreadable file is not retried every pass.
+    return n ? { ...f, why: n.why, contains: n.contains, use: n.use } : { ...f, why: '', contains: '', use: 'unknown' }
+  }))
 }
 
 async function openDiff($: $T, ev: ActivityEvent, how: string) {
@@ -654,6 +758,27 @@ async function nudgeOpen($: $T): Promise<number> {
   return due.length
 }
 
+// Edits without a test run are how regressions ship. When the session goes idle after a turn
+// that edited files and no test has passed since, the agent is told once per batch of edits to
+// run the project's tests (the last command that passed, when there is one).
+let testNudgedAt = 0
+async function nudgeTests($: $T): Promise<number> {
+  if (hasEnded || (await $.store.get('nudge').catch(() => undefined)) === 'off') return 0
+  if (await read($, turnA)) return 0
+  const events = await read($, eventsA)
+  const guard = guardOf(events)
+  const lastEdit = Math.max(0, ...events.filter(e => e.kind === 'code').map(e => e.at))
+  if (!guard || !guard.editsSince || lastEdit <= testNudgedAt) return 0
+  testNudgedAt = now()
+  await deliver(
+    $,
+    `[Ledger] ${guard.editsSince} edit${guard.editsSince === 1 ? '' : 's'} since the last passing test run${guard.command ? ` (${guard.command}, ${hhmm(guard.passedAt ?? 0)})` : ' (none in this session yet)'}: ${guard.edited.join(', ')}. ` +
+      `Run the project's tests (or the check that covers these files) before moving on, and report with the ${TOOL} tool. If they fail, say so and fix them first.`,
+    { interrupt: false, start: true },
+  )
+  return 1
+}
+
 // A requirement the agent (or a refinement from you) takes out of "done" is nudged again the
 // next time it gets there. Haiku's own re-judgements don't count: they flip statuses back and
 // forth, and each flip used to bring the same nudge again.
@@ -909,6 +1034,15 @@ async function measureFootprint($: $T, files: boolean) {
     const shared = (await sizes(sharedPaths)).map(x => ({ ...x, role: roleOf(x.path) }))
     const caches = await sizes(cacheDirs(home, plat.os, [plat.tmp]))
     const app = await sizes(appDirs(home, plat.os))
+    // Downloads join the session's files; every created file gets its size.
+    await update($, filesA, list => {
+      const out = [...list]
+      for (const f of fetched) if (!out.some(x => x.path === f.path)) out.push({ path: f.path, at: now(), kind: 'downloaded' })
+      return out
+    })
+    const fileSizes = await sizes((await read($, filesA)).map(f => f.path))
+    await update($, filesA, list => list.map(f => ({ ...f, kb: fileSizes.find(x => x.path === f.path)?.kb ?? f.kb })))
+    $.clock.after(0, () => void describeFiles($).catch(() => undefined))
     disk = {
       transcriptKb: transcript ? await size(transcript) : 0,
       ledgerKb: await size(stateFile()),
@@ -1180,6 +1314,8 @@ const TOOL_DESCRIPTION =
   'Any command counts (tests, builds, ffprobe, grep, curl, your own scripts), on its own or inside a compound command or pipe; ' +
   'files changed by shell commands are not edits. When nothing can be run (research, writing, a video to watch), ' +
   'set manual_check to what a person should check: the requirement stays "done, not verified" and is not asked about again. ' +
+  'In a research or writing session "verified" instead needs sources (the links or documents behind the answer) and an audit by another model that cleared it (/ledger audit); pass sources when you report. ' +
+  'ship: "first" when the first version cannot ship without it, "later" when it can wait. ' +
   'Start plan and todo items with the ids they serve, e.g. "[R2] Add search".'
 
 const TOOL_SCHEMA = {
@@ -1190,6 +1326,8 @@ const TOOL_SCHEMA = {
     status: { type: 'string', enum: ['in_progress', 'implemented', 'verified', 'blocked', 'needs_clarification', 'revisit'] },
     test_command: { type: 'string', description: 'verified: part of a Bash command that exited 0 after your last edit' },
     manual_check: { type: 'string', description: 'what a person should check when nothing can be run; stops the verify nudge for this requirement' },
+    sources: { type: 'string', description: 'research/writing: the sources behind the answer, one per line (URLs, file paths, document names)' },
+    ship: { type: 'string', enum: ['first', 'later'], description: 'whether the first version can ship without this' },
     note: { type: 'string' },
     title: { type: 'string', description: 'add: the new requirement' },
     derived_from: { type: 'string', description: 'add: id it splits' },
@@ -1223,7 +1361,21 @@ async function ledgerTool($: $T, a: Record<string, unknown>): Promise<string> {
   let reply = `${req.id} → ${STATUS[status].label}.`
   const evidence = [...req.evidence]
   let manual = status === 'implemented' ? req.manual : undefined
-  if (status === 'verified') {
+  const sources = [...(req.sources ?? []), ...s('sources').split(/\n|,\s+/).map(x => x.trim()).filter(x => x.length > 3)].filter((x, i, a) => a.indexOf(x) === i)
+  const kind = sessionKind(await read($, eventsA))
+  if (status === 'verified' && kind !== 'code' && !req.step) {
+    // Research and writing: nothing runs. Verified needs the sources behind the answer and an
+    // audit by another model that found no gap in it.
+    if (!sources.length) {
+      status = 'implemented'
+      reply = `${req.id} recorded as done but NOT verified: this is a ${kind} session, so verified needs sources (pass them in sources) and an audit by another model (/ledger audit) that clears it.`
+    } else if (!req.audit?.cleared) {
+      status = 'implemented'
+      reply = `${req.id} recorded as done but NOT verified: ${req.audit ? `the last audit (${hhmm(req.audit.at)}) found: ${req.audit.note}` : 'no audit by another model has cleared it yet'}. Sources are recorded; ask the user to run /ledger audit, or fix the gap and ask again.`
+    } else {
+      evidence.push({ kind: 'test', at: now(), text: `Audited by ${req.audit.model}: ${req.audit.note}` })
+    }
+  } else if (status === 'verified') {
     // Evidence is a command the agent names that ran and passed after the last edit; the
     // refusal says which of those failed, so the agent doesn't just run it again blindly.
     const found = findCheck(await read($, eventsA), s('test_command'))
@@ -1249,6 +1401,8 @@ async function ledgerTool($: $T, a: Record<string, unknown>): Promise<string> {
       const base = renudge(r, status)
       return {
         ...base, status, evidence, manual,
+        sources: sources.length ? sources : r.sources,
+        ship: s('ship') === 'first' || s('ship') === 'later' ? (s('ship') as 'first' | 'later') : r.ship,
         // A check by hand counts as this session's one nudge: it is not asked about again.
         nudgedAt: manual ? base.nudgedAt ?? now() : base.nudgedAt,
         needsReverify: status === 'verified' ? false : r.needsReverify,
@@ -1258,6 +1412,103 @@ async function ledgerTool($: $T, a: Record<string, unknown>): Promise<string> {
   )
   await save($)
   return reply
+}
+
+// ---------- research and writing: an audit by another model ----------
+
+const AUDIT_MODEL = 'claude-sonnet-5-5'
+
+// Each requirement that is done but not verified is judged, with its sources and the agent's
+// answers for it, by a different model than the one that wrote them. Cleared items with
+// sources become verified; the others keep the auditor's note.
+async function auditCommand($: $T, arg: string): Promise<string> {
+  const reqs = await read($, reqsA)
+  const wanted = arg.split(/\s+/).filter(x => /^R\d+$/i.test(x)).map(x => x.toUpperCase())
+  const due = reqs.filter(r => (wanted.length ? wanted.includes(r.id) : r.status === 'implemented') && !r.step)
+  if (!due.length) return wanted.length ? `None of ${wanted.join(', ')} is in this ledger.` : 'Nothing to audit: no requirement is done but not verified.'
+  const turns = await read($, turnsA)
+  const link = linker(reqs, turns.map(t => t.at))
+  const answerFor = (r: Requirement) => {
+    const own = turns.filter(t => link({ id: '', kind: 'message', at: t.at + 1, title: '' }).includes(r.id)).map(t => t.answer)
+    return (own.length ? own : turns.slice(-2).map(t => t.answer)).join('\n\n---\n\n').slice(-8000)
+  }
+  const items = due.map(r => ({ id: r.id, title: r.title, sources: r.sources ?? [], answer: answerFor(r) }))
+  const prompt = auditPrompt(items)
+  const res = await $.model.complete({ model: AUDIT_MODEL, system: AUDIT_SYSTEM, prompt, maxTokens: 3000 })
+  await tally($, 'audit', AUDIT_SYSTEM + prompt, res)
+  if (!res.isAnswered) return `The audit model did not answer (${res.reason ?? 'no reason given'}). Nothing was changed.`
+  const verdicts = parseAudit(res.text)
+  if (!verdicts.length) return 'The audit model answered, but not in a form Principia could read. Nothing was changed.'
+  let cleared = 0
+  await update($, reqsA, list => list.map(r => {
+    const v = verdicts.find(x => x.id === r.id)
+    if (!v) return r
+    const audit = { at: now(), model: AUDIT_MODEL, cleared: v.cleared, note: v.note }
+    const canVerify = v.cleared && (r.sources?.length ?? 0) > 0
+    if (canVerify) cleared++
+    return {
+      ...r, audit,
+      status: canVerify ? 'verified' : r.status,
+      evidence: [...r.evidence, { kind: canVerify ? 'test' as const : 'note' as const, at: now(), text: `${v.cleared ? 'Audit cleared' : 'Audit found a gap'} (${AUDIT_MODEL}): ${v.note}` }],
+    }
+  }))
+  await save($)
+  const gaps = verdicts.filter(v => !v.cleared)
+  const noSources = verdicts.filter(v => v.cleared && !(reqs.find(r => r.id === v.id)?.sources?.length))
+  return [
+    `Audited ${verdicts.length} with ${AUDIT_MODEL}: ${cleared} verified.`,
+    gaps.length ? `Gaps: ${gaps.map(g => `${g.id} (${g.note})`).join('; ')}.` : '',
+    noSources.length ? `Cleared but without sources, so not verified: ${noSources.map(v => v.id).join(', ')}. The agent attaches them with the ledger tool (sources).` : '',
+  ].filter(Boolean).join(' ')
+}
+
+// ---------- shipping ----------
+
+async function shipCommand($: $T, arg: string): Promise<string> {
+  const m = /^(R\d+)\s+(first|later)$/i.exec(arg)
+  if (!m) return 'Usage: /ledger ship R12 first (the first version needs it) or /ledger ship R12 later (it can wait).'
+  const id = (m[1] as string).toUpperCase()
+  const when = (m[2] as string).toLowerCase() as 'first' | 'later'
+  if (!(await read($, reqsA)).some(r => r.id === id)) return `No requirement ${id}.`
+  await update($, reqsA, list => list.map(r => (r.id === id ? { ...r, ship: when } : r)))
+  await save($)
+  return `${id}: ${when === 'first' ? 'needed for the first version' : 'can ship later'}.`
+}
+
+// A brief for a new session: the project's open requirements across all its sessions, what is
+// waiting on you, and what shipped last. Written next to the ledgers and returned to paste.
+async function briefCommand($: $T): Promise<string> {
+  const mine = await read($, reqsA)
+  const files = await $.fs.list(plat.data).catch(() => [] as { name: string }[])
+  type St = { sessionId: string; project?: string; cwd?: string; title?: string; at?: number; reqs?: Requirement[]; signals?: Signal[]; ship?: { at: number; command: string } }
+  const states: St[] = []
+  for (const f of files) {
+    if (!/^state-.*\.json$/.test(f.name)) continue
+    const st = await $.fs.read(join(plat.data, f.name)).then(t => JSON.parse(String(t)) as St).catch(() => undefined)
+    if (st && (st.cwd === sessionRoot || (st.project === project && project !== 'This computer'))) states.push(st)
+  }
+  const lines: string[] = [`# ${project}: where things stand`, '', `Written by Principia on ${new Date().toISOString().slice(0, 16).replace('T', ' ')} from ${states.length} session${states.length === 1 ? '' : 's'}.`, '']
+  const seen = new Map<string, { r: Requirement; from: string; at: number }>()
+  for (const st of states.sort((a, b) => (a.at ?? 0) - (b.at ?? 0))) {
+    for (const r of st.reqs ?? []) {
+      if (isStep(r)) continue
+      const key = r.title.toLowerCase().replace(/\W+/g, ' ').trim()
+      const prev = seen.get(key)
+      if (!prev || (r.at ?? 0) >= prev.at) seen.set(key, { r, from: st.title ?? st.sessionId.slice(0, 8), at: r.at })
+    }
+  }
+  const all = [...seen.values()]
+  const gate = shipGate(all.map(x => x.r), states.flatMap(st => st.signals ?? []))
+  const ship = states.map(st => st.ship).filter((x): x is { at: number; command: string } => !!x).sort((a, b) => b.at - a.at)[0]
+  lines.push(`## To ship the first version (${gate.first.length} open)`, ...gate.first.map(x => `- ${x.id} ${x.title} [${STATUS[x.status].label}]`), '')
+  if (gate.onYou.length) lines.push('## Waiting on you', ...gate.onYou.map(s => `- ${s.text}`), '')
+  if (gate.unverified.length) lines.push('## Done, not verified', ...gate.unverified.map(x => `- ${x.id} ${x.title}`), '')
+  if (gate.later.length) lines.push('## Can ship later', ...gate.later.map(x => `- ${x.id} ${x.title} [${STATUS[x.status].label}]`), '')
+  lines.push(`## Last shipped`, ship ? `- ${hhmm(ship.at)} ${ship.command}` : '- nothing recorded yet', '')
+  lines.push('## Verified', ...all.filter(x => x.r.status === 'verified').map(x => `- ${x.r.id} ${x.r.title}`))
+  const out = join(plat.data, `brief-${project.replace(/[^\w.-]+/g, '_')}.md`)
+  await $.fs.write(out, lines.join('\n'))
+  return `Brief written to ${out} (${all.length} requirements from ${states.length} sessions, ${gate.first.length} open before the first version ships, ${gate.onYou.length} waiting on you). Paste it into a new session, or start one with it. ${mine.length ? '' : 'This session has no ledger of its own yet.'}`
 }
 
 // ---------- pane size ----------
@@ -1348,7 +1599,7 @@ export const register: Register = on => {
     await mirror($)
     // A session started without tools refuses this; the ledger still works without it.
     await $.tool.register({ name: 'ledger', description: TOOL_DESCRIPTION, inputSchema: TOOL_SCHEMA, isDeferred: false }).catch(() => undefined)
-    await $.command.register({ name: 'ledger', description: 'Open the requirements ledger pane', argumentHint: '[window [terminal] | install | refresh | nudge on|off | theme … | import [days | refresh | allow | revoke] | wide | narrow]' })
+    await $.command.register({ name: 'ledger', description: 'Open the requirements ledger pane', argumentHint: '[window [terminal] | install | refresh | audit [R#…] | brief | ship R# first|later | nudge on|off | theme … | import [days | refresh | allow | revoke] | wide | narrow]' })
     void openPane($)
     return next(e)
   })
@@ -1365,6 +1616,9 @@ export const register: Register = on => {
       return { text: arg === 'nudge off' ? 'Principia will not ask the agent to verify on its own. /ledger nudge on turns it back on; g in the window still asks once.' : 'When a session goes idle with requirements done but not verified, Principia asks the agent to verify them, once each.' }
     }
     if (arg === 'refresh') return { text: await refreshCommand($).catch(err => `Could not refresh: ${err instanceof Error ? err.message : String(err)}`) }
+    if (arg === 'audit' || arg.startsWith('audit ')) return { text: await auditCommand($, raw.slice(5).trim()).catch(err => `Could not audit: ${err instanceof Error ? err.message : String(err)}`) }
+    if (arg === 'brief') return { text: await briefCommand($).catch(err => `Could not write the brief: ${err instanceof Error ? err.message : String(err)}`) }
+    if (arg.startsWith('ship ')) return { text: await shipCommand($, raw.slice(5).trim()) }
     if (arg === 'wide' || arg === 'narrow') await $.store.set('width', arg)
     const width = await openPane($)
     return { text: `Principia opened (${width}). /ledger window opens it in your terminal; /ledger theme changes the colours; /ledger wide or /ledger narrow resizes this pane; dragging the pane edge also works.` }
@@ -1489,7 +1743,7 @@ export const register: Register = on => {
           // turns, every open requirement is re-judged against the whole session so far.
           if (turns.length % CONSOLIDATE_EVERY === 0) await consolidate($)
           // Then, if the session stays idle, the agent is asked to verify what it says is done.
-          $.clock.after(NUDGE_AFTER, () => void nudgeOpen($).then(n => (n ? 0 : nudgeVerify($))).catch(() => undefined))
+          $.clock.after(NUDGE_AFTER, () => void nudgeOpen($).then(n => (n ? 0 : nudgeTests($))).then(n => (n ? 0 : nudgeVerify($))).catch(() => undefined))
         }))
       }
       await update($, repliesA, list => list.map(r => (r.delivery === 'received' ? { ...r, delivery: 'acted' as const } : r)))
@@ -1542,14 +1796,16 @@ export const register: Register = on => {
     const [reqs, events, replies, view, signals, plan, previews, turns, footprint] = await Promise.all([
       read($, reqsA), read($, eventsA), read($, repliesA), read($, viewA), read($, signalsA), read($, planA), read($, previewsA), read($, turnsA), read($, footprintA),
     ])
-    const openSignals = signals.filter(x => !x.dismissed)
+    const openSignals = signals.filter(x => !x.dismissed && !x.resolvedAt)
     const p = palette(await read($, themeA), view.dark)
     const setView = (patch: Partial<View>) => update($, viewA, v => ({ ...v, ...patch }))
     const chip = (label: string, tone: Tone) => (
       <Text color={toneFg(p, tone)} backgroundColor={toneBg(p, tone)}> {label} </Text>
     )
     const verified = reqs.filter(r => r.status === 'verified' && !r.needsReverify).length
-    const live = reqs.filter(r => r.status !== 'deferred')
+    const live = reqs.filter(r => r.status !== 'deferred' && !isStep(r))
+    const guard = guardOf(events)
+    const needsYou = openSignals.filter(s => s.kind === 'decision' || s.kind === 'blocker' || s.kind === 'manual' || s.kind === 'blocked' || s.kind === 'conflict').length
 
     const tabs = (
       <Box flexDirection="row" gap={1} paddingBottom={1}>
@@ -1567,8 +1823,13 @@ export const register: Register = on => {
       <Box flexDirection="column" paddingBottom={1}>
         <Text color={p.text} bold>Principia</Text>
         <Text color={p.text2}>
-          {live.length} requirements · <Text color={p.done}>{verified} verified</Text> · {live.length - verified} open
+          {live.length} requirements · <Text color={p.done}>{verified} verified</Text> · {live.length - verified} open{needsYou ? <Text color={p.warn}> · {needsYou} need{needsYou === 1 ? 's' : ''} you</Text> : null}
         </Text>
+        {guard && (
+          <Text color={guard.editsSince ? p.warn : p.done}>
+            {guard.editsSince ? `${guard.editsSince} edit${guard.editsSince === 1 ? '' : 's'} since the last passing test${guard.passedAt ? ` (${hhmm(guard.passedAt)})` : ' (none yet)'}` : `Tests passed ${hhmm(guard.passedAt ?? 0)}, no edits since`}
+          </Text>
+        )}
         {footprint && (
           <Text color={p.text3}>
             {fmtKb(footprint.ramKb)} memory in {footprint.procs} process{footprint.procs === 1 ? '' : 'es'} · {fmtKb(ownKb(footprint))} on disk, local only{footprint.sharedKb ? ` · ${fmtKb(footprint.sharedKb)} shared on the project` : ''} · M in the window for details

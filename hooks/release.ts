@@ -1,13 +1,13 @@
 // The standalone principia program published with this version: written by scripts/build.ts
 // when a release is cut, and checked against before anything downloaded is run.
 export const RELEASE: { version: string; repo: string; sha256: Record<string, string> } = {
-  version: '0.5.5',
+  version: '0.6.0',
   repo: 'aar2dee2/principia',
   sha256: {
-    "principia-darwin-arm64": "3367df79b6fa50903672b97b687a8027db51096e7cefb40e40b4ff1fa0d6ef09",
-    "principia-darwin-x64": "ecf9a7a86c1dcde2f624f3ad728db4cae42411da0f2b8f87f3e65ffca927666f",
-    "principia-linux-x64": "ffcce20b862900a1c1ba3832a36e451e36e930a550b1995305646ef70bde4c0a",
-    "principia-linux-arm64": "d2e993247a48af04575aecbca97a408c84b6e2e2b943af155d83af19717d45ef",
-    "principia-windows-x64.exe": "94004674e848c7450daccdd6fdecc1e1f314ca275ecae5d5e299cd310d8ac1c0"
+    "principia-darwin-arm64": "0e79378ccd47550cc093f9050f5710c1a969f4ba80dd08d55d5d1395e1a9ed4c",
+    "principia-darwin-x64": "f6d16ac5ae2f05b5b10cd7eabc67c1c26c28b1232c587ecb2d661dd9a1b6523d",
+    "principia-linux-x64": "2f0d9b817a291378630acd4f14c8b7f0fbbbb066cb22046f691436183288f034",
+    "principia-linux-arm64": "69c5f63e4f3e2b8465e43a54749c0710e4d7fb30bfb49c6da0048a637cff0283",
+    "principia-windows-x64.exe": "c080b5ac80a4b787af3c0dd322c6fbf69ed5e5a5b32d5913b653f787aa4d5468"
   },
 }

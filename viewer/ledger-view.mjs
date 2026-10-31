@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url'
 import { spawn, spawnSync } from 'node:child_process'
 
 import { DEFAULT_THEME, palette } from '../hooks/theme.ts'
-import { REQ_FILTERS, filterReqs, gapOf, isSecretPath, isVerified, linker } from '../hooks/work.ts'
+import { REQ_FILTERS, filterReqs, gapOf, isSecretPath, isStep, isVerified, linker, shipGate } from '../hooks/work.ts'
 import { LIFETIME, fmtKb } from '../hooks/footprint.ts'
 
 const G = globalThis.PRINCIPIA ?? { args: process.argv.slice(2), self: [process.execPath, process.argv[1]], isCompiled: false }
@@ -51,19 +51,21 @@ if (!process.env.PRINCIPIA_VIEWER_CHILD) {
 const sessions = new Map() // id -> { state, mtime }
 const titles = new Map() // id -> { title, mtime } from Claude Code's own transcript
 let transcriptOf = new Map() // id -> transcript path
-let prefs = { dark: undefined, showSessions: true, showAudit: true, showHeadless: false }
+// Three panes always (sessions, requirements, detail); two fold away (the middle column and needs-you).
+let prefs = { dark: undefined, showSessions: true, showAudit: true, showHeadless: false, showMiddle: false, showNeedsYou: false }
+let help = false
 try { prefs = { ...prefs, ...JSON.parse(fs.readFileSync(PREFS, 'utf8')) } } catch { /* defaults */ }
 const savePrefs = () => { try { fs.writeFileSync(PREFS, JSON.stringify(prefs)) } catch { /* next time */ } }
 
 const EMPTY = { reqs: [], events: [], replies: [], signals: [], plan: [], previews: [], editors: [], isWorking: false, title: '', project: '' }
 let S = EMPTY
 let focus = 'reqs' // sessions | reqs | signals | middle
-let middle = 'activity' // activity | plan | tests | preview | signals | footprint
+let middle = 'activity' // activity | plan | tests | preview | files | findings | footprint | project
 let showAll = false
 let allActivity = false // A: every event, not only the requirement in view's
 let search = ''
 let reqFilter = 'all'
-const sel = { reqs: 0, signals: 0, activity: 0, plan: 0, tests: 0, preview: 0, footprint: 0 }
+const sel = { reqs: 0, signals: 0, activity: 0, plan: 0, tests: 0, preview: 0, footprint: 0, files: 0, findings: 0, project: 0 }
 let compose = null // { mode, text, interrupt, eventId, refines } | { mode: 'search', text }
 let flash = ''
 // Commands are ordered by time across windows: the session keeps only ones newer than the last.
@@ -117,7 +119,9 @@ const STATUS = {
   revisit: ['Done for now · revisit', 'done'],
 }
 const KIND = { discovery: ['Discovery', 'muted'], plan: ['Plan', 'active'], code: ['Code change', 'active'], command: ['Command', 'muted'], test: ['Test', 'warn'], message: ['Agent', 'active'] }
-const SIGNAL = { failed: ['Failed', 'danger'], blocked: ['Blocked', 'danger'], finding: ['Found', 'warn'], conflict: ['Conflict', 'danger'] }
+const SIGNAL = { failed: ['Failed', 'danger'], blocked: ['Blocked', 'danger'], finding: ['Found', 'warn'], conflict: ['Conflict', 'danger'], decision: ['Decide', 'warn'], blocker: ['On you', 'danger'], manual: ['Check', 'warn'] }
+const NEEDS_YOU = new Set(['decision', 'blocker', 'manual', 'blocked', 'conflict', 'failed'])
+const KINDS = { code: 'code', research: 'research', writing: 'writing' }
 const DELIVERY = { kept: 'comment, not sent', queued: 'queued for your next prompt', received: 'received by agent', acted: 'agent finished a turn after it', failed: 'not delivered' }
 const MODES = { comment: 'Comment (agent does not see it)', requirement: 'New requirement', refine: 'Refine', redirect: 'Instruction to the agent' }
 
@@ -231,14 +235,14 @@ function sessionLines(w) {
     for (const st of group) {
       const isCur = st.sessionId === cur
       const live = isLive(st)
-      const L = st.reqs.filter(r => r.status !== 'deferred')
+      const L = st.reqs.filter(r => r.status !== 'deferred' && !isStep(r))
       const v = L.filter(isVerified).length
-      const signals = (st.signals ?? []).filter(x => !x.dismissed).length
+      const needs = (st.signals ?? []).filter(x => !x.dismissed && !x.resolvedAt && NEEDS_YOU.has(x.kind)).length
       const dot = st.isWorking && live ? seg('● ', P.active) : live ? seg('○ ', P.done) : st.imported ? seg('◌ ', P.text3) : seg('· ', P.text3)
       const rows = wrapText(nameOf(st), w - 2).slice(0, 2)
       rows.forEach((row, i) => lines.push({ sel: isCur, line: [i ? seg('  ') : dot, seg(row, live || isCur ? P.text : P.text3, undefined, isCur)] }))
-      lines.push({ sel: isCur, line: [seg('  '), seg(`${v}/${L.length} verified`, v === L.length && L.length ? P.done : P.text3),
-        ...(signals ? [seg(` · ${signals} signal${signals === 1 ? '' : 's'}`, P.warn)] : []),
+      lines.push({ sel: isCur, line: [seg('  '), seg(`${KINDS[st.kind] ?? ''}${st.kind ? ' · ' : ''}`, P.text3), seg(`${v}/${L.length}`, v === L.length && L.length ? P.done : P.text3),
+        ...(needs ? [seg(` · ${needs} need${needs === 1 ? 's' : ''} you`, P.warn)] : []),
         ...(live ? [] : [seg(st.imported ? ' · imported' : ' · not running', P.text3)])] })
     }
     lines.push([])
@@ -248,7 +252,10 @@ function sessionLines(w) {
 }
 
 const shownReqs = () => filterReqs(S.reqs, search, reqFilter)
-const openSignals = () => (S.signals ?? []).filter(x => !x.dismissed).slice().reverse()
+// The inbox is what only you can do (plus failures); findings are the agent's commentary, kept apart.
+const openSignals = () => (S.signals ?? []).filter(x => !x.dismissed && !x.resolvedAt && NEEDS_YOU.has(x.kind)).slice().reverse()
+const findings = () => (S.signals ?? []).filter(x => !x.dismissed && !x.resolvedAt && x.kind === 'finding').slice().reverse()
+const sessionFiles = () => [...(S.files ?? [])].reverse()
 // The requirement in view: the one selected in the requirements column, wherever focus is.
 const reqInView = () => shownReqs()[sel.reqs]
 // Which requirements each event was for: its own links, else worked out from when you asked.
@@ -337,8 +344,8 @@ function reqLines(w) {
 
 function signalLines(w, heading = true) {
   const list = openSignals()
-  const lines = heading ? [[seg(`SIGNALS  ${list.length}`, P.text2, undefined, true), seg('  failed · blocked · found · conflict', P.text3)], []] : []
-  if (!list.length) lines.push(...wrap('Nothing to act on. Failed or refused tool calls, unexpected findings and conflicting instructions show here.', w, P.text3))
+  const lines = heading ? [[seg(`NEEDS YOU  ${list.length}`, P.text2, undefined, true), seg('  decisions · blockers · checks by hand', P.text3)], []] : []
+  if (!list.length) lines.push(...wrap('Nothing waits on you. Decisions the agent asks for, things only you can run or grant, checks by hand, conflicts and failures show here. 5 hides this column.', w, P.text3))
   list.forEach((x, i) => {
     const [label, t] = SIGNAL[x.kind] ?? ['Signal', 'muted']
     const isSel = (focus === 'signals' || (focus === 'middle' && middle === 'signals')) && i === sel.signals
@@ -349,11 +356,33 @@ function signalLines(w, heading = true) {
 }
 
 function middleLines(w, withSignals) {
-  const tabs = [['activity', `1 Activity ${shownEvents().length}`], ['plan', `2 Plan ${S.plan?.length ?? 0}`], ['tests', `3 Tests ${testRuns().length}`],
-    ['preview', `4 Preview ${S.previews?.length ?? 0}`], ...(withSignals ? [['signals', `5 Signals ${openSignals().length}`]] : []), ...(middle === 'footprint' ? [['footprint', 'M Footprint']] : [])]
+  const tabs = [['activity', `1 Activity`], ['plan', `2 Plan`], ['tests', `3 Tests`], ['preview', `4 Preview`], ['files', `6 Files`], ['findings', `7 Found ${findings().length}`], ['footprint', 'M Footprint'], ['project', 'P Project']]
   const lines = [tabs.flatMap(([id, label]) => [seg(` ${label} `, middle === id ? P.text : P.text3, middle === id ? P.surface2 : undefined, middle === id), seg(' ')]), []]
   const isSel = (list, i) => focus === 'middle' && i === sel[list]
   if (middle === 'signals') return [...lines, ...signalLines(w, false)]
+  if (middle === 'findings') {
+    const list = findings()
+    if (!list.length) lines.push(...wrap('No findings. Things the agent hit (a failure, data at risk, part of an ask left undone, a decision it took on its own) show here and fade after a few turns.', w, P.text3))
+    list.forEach((x, i) => {
+      lines.push({ sel: isSel('findings', i), line: [seg(isSel('findings', i) ? '› ' : '  ', P.active), seg(`${hhmm(x.at)} `, P.text3), ...(x.reqId ? [seg(`${x.reqId} `, P.text3)] : [])] })
+      for (const row of wrapText(x.text, w - 4).slice(0, 3)) lines.push({ sel: isSel('findings', i), line: [seg('    '), seg(row, P.text)] })
+    })
+    return lines
+  }
+  if (middle === 'files') {
+    const list = sessionFiles()
+    const total = list.reduce((n, f) => n + (f.kb || 0), 0)
+    lines.push([seg(`${list.length} file${list.length === 1 ? '' : 's'} created by this session`, P.text2), seg(total ? ` · ${fmtKb(total)}` : '', P.text3)])
+    if (!list.length) lines.push(...wrap('Nothing yet. Files the agent writes for the first time, and downloads, are listed here with why each was made and what it is for.', w, P.text3))
+    list.forEach((f, i) => {
+      const name = shortPath(f.path, w - 14)
+      lines.push({ sel: isSel('files', i), line: [seg(isSel('files', i) ? '› ' : '  ', P.active), seg(name, P.text), seg(f.kb !== undefined ? `  ${fmtKb(f.kb)}` : '', P.text3)] })
+      const note = f.why === undefined ? 'describing…' : f.use ? `${f.use}${f.why ? ` · ${f.why}` : ''}` : 'not described'
+      for (const row of wrapText(note, w - 4).slice(0, 2)) lines.push({ sel: isSel('files', i), line: [seg('    '), seg(row, f.use === 'scratch output' || f.use === 'a one-off script' ? P.text3 : P.text2)] })
+    })
+    return lines
+  }
+  if (middle === 'project') return [...lines, ...projectLines(w, isSel)]
   if (middle === 'activity') {
     const evs = shownEvents()
     const r = forReq()
@@ -399,15 +428,21 @@ function middleLines(w, withSignals) {
     lines.push([seg('Memory ', P.text3), seg(fmtKb(ram), P.text, undefined, true), seg(' · sessions\' own files ', P.text3), seg(fmtKb(disk), P.text, undefined, true),
       ...(sharedKb ? [seg(' · shared ', P.text3), seg(fmtKb(sharedKb), P.text, undefined, true)] : []), seg(' · this computer only', P.text3)])
     lines.push([])
-    const cw = 9
-    lines.push([seg(' '.repeat(w - cw * 4 - 2)), seg('memory'.padStart(cw), P.text3), seg('own files'.padStart(cw), P.text3), seg('edited'.padStart(cw), P.text3), seg('folder'.padStart(cw), P.text3)])
+    const cw = 10
+    const nw = Math.max(16, w - cw * 3 - 2)
+    lines.push([seg(' '.repeat(nw), P.text3), seg('memory'.padStart(cw), P.text3), seg('files'.padStart(cw), P.text3), seg('edited'.padStart(cw), P.text3)])
     list.forEach((x, i) => {
-      const name = [...`${x.live ? (x.st.isWorking ? '● ' : '○ ') : '· '}${nameOf(x.st)}`].slice(0, w - cw * 4 - 3).join('')
-      lines.push({ sel: isSel('footprint', i), line: [seg(name.padEnd(w - cw * 4 - 2), x.live ? P.text : P.text3),
+      const name = [...`${x.live ? (x.st.isWorking ? '● ' : '○ ') : '· '}${nameOf(x.st)}`].slice(0, nw - 1).join('')
+      lines.push({ sel: isSel('footprint', i), line: [seg(name.padEnd(nw), x.live ? P.text : P.text3),
         seg((x.live ? fmtKb(x.ramKb) : '–').padStart(cw), x.live ? P.active : P.text3), seg(fmtKb(x.diskKb).padStart(cw), P.text),
-        seg((x.f.editedFiles ? fmtKb(x.editedKb) : '–').padStart(cw), x.f.editedFiles ? P.text2 : P.text3),
-        seg((x.workspace ? (x.ownsFolder ? fmtKb(x.workspaceKb) : 'shared') : '–').padStart(cw), x.workspace && x.ownsFolder ? P.warn : P.text3)] })
+        seg((x.f.editedFiles ? fmtKb(x.editedKb) : '–').padStart(cw), x.f.editedFiles ? P.text2 : P.text3)] })
     })
+    const own = usageOf()
+    if (own.session || own.all) {
+      lines.push([], [seg('PRINCIPIA ITSELF', P.text2, undefined, true), seg('  what this plugin spends on Haiku and the audit model', P.text3)])
+      if (own.session) lines.push(...wrap(`This session: ${own.session.calls} calls, ${fmtTok(own.session.tokensIn)} in, ${fmtTok(own.session.tokensOut)} out${own.session.estimated ? ' (estimated from text)' : ''} · ${Object.entries(own.session.byPurpose ?? {}).map(([k, v]) => `${k} ${v}`).join(', ')}.`, w, P.text2))
+      if (own.all) lines.push(...wrap(`All sessions since ${new Date(own.all.since).toISOString().slice(0, 10)}: ${own.all.calls} calls, ${fmtTok(own.all.tokensIn)} in, ${fmtTok(own.all.tokensOut)} out · about $${cost(own.all).toFixed(2)} at Haiku's rate.`, w, P.text2))
+    }
     if (shared.projects.length || shared.caches) {
       lines.push([], [seg('SHARED', P.text2, undefined, true), seg('  counted once, not per session', P.text3)])
       const named = items => `${items.slice(0, 4).map(i => `${path.basename(i.path)} ${fmtKb(i.kb)}`).join(', ')}${items.length > 4 ? ', …' : ''}`
@@ -471,7 +506,21 @@ function signalContext(sig, w) {
 
 function detailLines(w) {
   const lines = []
-  const sig = openSignals()[sel.signals]
+  if (help) return helpLines(w)
+  const sig = focus === 'middle' && middle === 'findings' ? findings()[sel.findings] : openSignals()[sel.signals]
+  if (focus === 'middle' && middle === 'files') {
+    const f = sessionFiles()[sel.files]
+    if (!f) return lines
+    lines.push(...wrap(f.path.replace(HOME, '~'), w, P.text), [seg(`${f.kind === 'downloaded' ? 'Downloaded' : 'Written'} ${hhmm(f.at)}${f.kb !== undefined ? ` · ${fmtKb(f.kb)}` : ''}`, P.text3)], [])
+    if (f.why === undefined) lines.push(...wrap('Being described: Principia reads the start of the file and asks Haiku why it was made and what it is for.', w, P.text3))
+    else {
+      lines.push([seg('Why', P.text3)], ...wrap(f.why || 'Not known.', w, P.text2, '  '), [])
+      lines.push([seg('Contains', P.text3)], ...wrap(f.contains || 'Not known.', w, P.text2, '  '), [])
+      lines.push([seg('Use in this session', P.text3)], ...wrap(f.use || 'Not known.', w, P.text2, '  '))
+    }
+    return lines
+  }
+  if (focus === 'middle' && middle === 'project') return [...lines, ...projectDetail(w)]
   if (focus === 'middle' && middle === 'footprint') {
     const x = footList()[sel.footprint]
     if (!x) return lines
@@ -481,13 +530,13 @@ function detailLines(w) {
     else lines.push([seg('Memory now', P.text3)], ...wrap('Nothing: the session is not running.', w, P.text2, '  '), [])
     lines.push([seg('Files it leaves', P.text3)])
     lines.push(...wrap(`Transcript ${fmtKb(x.transcriptKb)}: ${LIFETIME.transcript(keepDays)}.`, w, P.text2, '  '))
-    if (transcriptOf.get(x.st.sessionId)) lines.push(...wrap(transcriptOf.get(x.st.sessionId).replace(HOME, '~'), w, P.text3, '    '))
+    if (transcriptOf.get(x.st.sessionId)) lines.push([seg('    '), seg(shortPath(transcriptOf.get(x.st.sessionId), w - 4), P.text3)])
     lines.push(...wrap(`Ledger ${fmtKb(x.ledgerKb)}: ${LIFETIME.ledger}.`, w, P.text2, '  '))
-    if (x.workspace) lines.push(...wrap(`Folder ${fmtKb(x.ownsFolder ? x.workspaceKb : f.workspaceKb || 0)}${x.folderSharers > 1 ? ` (shared by ${x.folderSharers} sessions, counted once)` : ''}: ${LIFETIME[x.workspace.kind]}.`, w, P.text2, '  '), ...wrap(x.workspace.path.replace(HOME, '~'), w, P.text3, '    '))
+    if (x.workspace) lines.push(...wrap(`Folder ${fmtKb(x.ownsFolder ? x.workspaceKb : f.workspaceKb || 0)}${x.folderSharers > 1 ? ` (shared by ${x.folderSharers} sessions, counted once)` : ''}: ${LIFETIME[x.workspace.kind]}.`, w, P.text2, '  '), [seg('    '), seg(shortPath(x.workspace.path, w - 4), P.text3)])
     else lines.push(...wrap('No folder of its own: it works in your project, which is yours to keep.', w, P.text2, '  '))
     if (f.uncommittedFiles) lines.push(...wrap(`Uncommitted in the project ${fmtKb(f.uncommittedKb || 0)} in ${f.uncommittedFiles} file${f.uncommittedFiles === 1 ? '' : 's'}: ${LIFETIME.uncommitted}.`, w, P.text2, '  '))
     if (f.editedFiles !== undefined) lines.push(...wrap(`Edited ${fmtKb(x.editedKb)} in ${f.editedFiles} file${f.editedFiles === 1 ? '' : 's'}: ${LIFETIME.edited}.`, w, P.text2, '  '))
-    if (f.scratch) lines.push(...wrap(`Temp folder ${fmtKb(x.scratchKb)}: ${LIFETIME.scratchpad}.`, w, P.text2, '  '), ...wrap(f.scratch.replace(HOME, '~'), w, P.text3, '    '))
+    if (f.scratch) lines.push(...wrap(`Temp folder ${fmtKb(x.scratchKb)}: ${LIFETIME.scratchpad}.`, w, P.text2, '  '), [seg('    '), seg(shortPath(f.scratch, w - 4), P.text3)])
     if (f.fetched?.length) {
       lines.push(...wrap(`Downloaded ${fmtKb(x.fetchedKb)}: ${LIFETIME.fetched}.`, w, P.text2, '  '))
       for (const it of f.fetched) lines.push(...wrap(`${it.path.replace(HOME, '~')} ${fmtKb(it.kb)}`, w, P.text3, '    '))
@@ -561,22 +610,130 @@ function column(lines, h) {
   return lines.slice(Math.max(0, start), Math.max(0, start) + h).map(l => (Array.isArray(l) ? { line: l } : l))
 }
 
+// Sessions, requirements and detail are always there (sessions folds with S on narrow
+// screens); the middle column (1-4, 6, 7, M, P) and needs-you (5) open when asked and fold again.
 function layout(W) {
   const gutter = 3
   const cols = []
-  const withSessions = prefs.showSessions && W >= 120
+  const withSessions = prefs.showSessions && W >= 110
   let rest = W
-  if (withSessions) { cols.push(['sessions', 28]); rest -= 28 + gutter }
-  if (rest >= 170) {
-    const wr = Math.floor((rest - gutter * 3) * 0.27), ws = Math.floor((rest - gutter * 3) * 0.21), wm = Math.floor((rest - gutter * 3) * 0.27)
-    cols.push(['reqs', wr], ['middle', wm], ['signals', ws], ['detail', rest - gutter * 3 - wr - ws - wm])
-  } else if (rest >= 100) {
-    const wr = Math.floor((rest - gutter * 2) * 0.32), wm = Math.floor((rest - gutter * 2) * 0.36)
-    cols.push(['reqs', wr], ['middle', wm], ['detail', rest - gutter * 2 - wr - wm])
-  } else {
-    cols.push(['stack', rest])
-  }
+  if (withSessions) { cols.push(['sessions', 26]); rest -= 26 + gutter }
+  if (rest < 90) return [...cols.filter(([c]) => c !== 'sessions'), ['stack', W]]
+  const open = ['reqs', ...(prefs.showMiddle ? ['middle'] : []), ...(prefs.showNeedsYou && rest >= 150 ? ['signals'] : []), 'detail']
+  const share = { reqs: 0.34, middle: 0.3, signals: 0.22, detail: 0.36 }
+  const total = open.reduce((n, c) => n + share[c], 0)
+  const usable = rest - gutter * (open.length - 1)
+  let used = 0
+  open.forEach((c, i) => {
+    const wc = i === open.length - 1 ? usable - used : Math.floor(usable * share[c] / total)
+    used += wc
+    cols.push([c, wc])
+  })
   return cols
+}
+
+// Paths: home as ~, and the middle cut out when they are longer than the column.
+function shortPath(p, w) {
+  const s = String(p).replace(HOME, '~')
+  if (s.length <= w) return s
+  const keep = Math.max(8, Math.floor((w - 1) / 2))
+  return `${s.slice(0, keep)}…${s.slice(-(w - 1 - keep))}`
+}
+
+// Principia's own spend: this session's, and the shared all-time total (the newest state has it).
+function usageOf() {
+  const all = [...sessions.values()].map(x => x.state).filter(st => st.allTimeUsage).sort((a, b) => (b.at ?? 0) - (a.at ?? 0))[0]?.allTimeUsage
+  return { session: S.usage, all }
+}
+const fmtTok = n => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M tokens` : n >= 1000 ? `${Math.round(n / 1000)}k tokens` : `${n} tokens`)
+// Haiku 5.5 list price per million tokens (in, out); audit calls are a few, at Sonnet's rate, so this is a floor.
+const cost = u => (u.tokensIn * 1 + u.tokensOut * 5) / 1_000_000
+
+// ---------- the project: every session's requirements together, and what stops it shipping ----------
+
+function projectStates() {
+  const st = sessions.get(cur)?.state
+  if (!st) return []
+  return sessionList().filter(x => (st.cwd && x.cwd === st.cwd) || (projectOf(x) === projectOf(st) && projectOf(st) !== 'This computer'))
+}
+// One row per requirement across the project's sessions: same wording, the newest wins.
+function projectReqs() {
+  const seen = new Map()
+  for (const st of [...projectStates()].sort((a, b) => (a.at ?? 0) - (b.at ?? 0))) {
+    for (const r of st.reqs ?? []) {
+      if (isStep(r) || r.status === 'deferred') continue
+      const key = r.title.toLowerCase().replace(/\W+/g, ' ').trim()
+      const prev = seen.get(key)
+      if (!prev || (r.at ?? 0) >= prev.at) seen.set(key, { r, st, at: r.at ?? 0 })
+    }
+  }
+  return [...seen.values()]
+}
+function projectRows() {
+  const items = projectReqs()
+  const states = projectStates()
+  const gate = shipGate(items.map(x => x.r), states.flatMap(st => st.signals ?? []))
+  const ship = states.map(st => st.ship).filter(Boolean).sort((a, b) => b.at - a.at)[0]
+  const rows = []
+  const push = (section, list, map) => { if (list.length) { rows.push({ section }); for (const x of list) rows.push(map(x)) } }
+  push(`TO SHIP THE FIRST VERSION  ${gate.first.length}`, gate.first, r => ({ r, st: items.find(x => x.r === r)?.st }))
+  push(`WAITING ON YOU  ${gate.onYou.length}`, gate.onYou, s => ({ sig: s, st: states.find(st => (st.signals ?? []).includes(s)) }))
+  push(`DONE, NOT VERIFIED  ${gate.unverified.length}`, gate.unverified, r => ({ r, st: items.find(x => x.r === r)?.st }))
+  push(`CAN SHIP LATER  ${gate.later.length}`, gate.later, r => ({ r, st: items.find(x => x.r === r)?.st }))
+  rows.push({ section: `LAST SHIPPED`, text: ship ? `${hhmm(ship.at)} ${ship.command}` : 'nothing recorded yet (a passing git push, gh release, deploy or publish counts)' })
+  return { rows, items, gate, states }
+}
+function projectLines(w, isSel) {
+  const { rows, items, states } = projectRows()
+  const st = sessions.get(cur)?.state
+  const lines = [[seg(`${st ? projectOf(st) : ''}  `, P.text, undefined, true), seg(`${states.length} session${states.length === 1 ? '' : 's'} · ${items.length} requirements · ${items.filter(x => isVerified(x.r)).length} verified`, P.text3)], []]
+  let i = 0
+  for (const row of rows) {
+    if (row.section) { lines.push([seg(row.section, P.text2, undefined, true)]); if (row.text) lines.push(...wrap(row.text, w, P.text3, '  ')); continue }
+    const selected = isSel('project', i)
+    if (row.r) {
+      const [label, t] = row.r.needsReverify ? ['Re-verify', 'warn'] : STATUS[row.r.status]
+      wrapText(row.r.title, w - 4).slice(0, 2).forEach((line, j) => lines.push({ sel: selected, line: [seg(j ? '    ' : selected ? '› ' : '  ', P.active), seg(j ? '' : `${row.r.id} `, P.text3), seg(line, P.text)] }))
+      lines.push({ sel: selected, line: [seg('    '), seg(label, tone(t)), seg(row.st ? `  ${nameOf(row.st).slice(0, Math.max(8, w - label.length - 8))}` : '', P.text3)] })
+    } else if (row.sig) {
+      const [label, t] = SIGNAL[row.sig.kind] ?? ['Signal', 'muted']
+      lines.push({ sel: selected, line: [seg(selected ? '› ' : '  ', P.active), chip(label, t), seg(row.st ? `  ${nameOf(row.st).slice(0, Math.max(8, w - 14))}` : '', P.text3)] })
+      for (const line of wrapText(row.sig.text, w - 4).slice(0, 2)) lines.push({ sel: selected, line: [seg('    '), seg(line, P.text)] })
+    }
+    i++
+  }
+  lines.push([], ...wrap('/ledger ship R12 first|later moves a requirement between the two lists; /ledger brief writes this as a file to start a new session from.', w, P.text3))
+  return lines
+}
+function projectDetail(w) {
+  const { rows } = projectRows()
+  const row = rows.filter(x => !x.section)[sel.project]
+  if (!row) return []
+  const lines = []
+  if (row.r) {
+    const [label, t] = STATUS[row.r.status]
+    lines.push(...wrap(row.r.title, w, P.text), [seg(`${row.r.id}  `, P.text3), chip(label, t), seg(row.st ? `  in ${nameOf(row.st)}` : '', P.text3)], [])
+    for (const h of row.r.history) lines.push([seg(`${hhmm(h.at)} ${h.kind === 'original' ? 'Asked' : 'Refined'}`, P.text3)], ...wrap(`“${h.text}”`, w, P.text2, '  '))
+    for (const e of row.r.evidence.slice(-4)) lines.push(...wrap(`${e.kind === 'test' ? 'Passed: ' : e.kind === 'manual' ? 'Accepted by you: ' : 'Note: '}${e.text}`, w, e.kind === 'test' || e.kind === 'manual' ? P.done : P.text2))
+  } else if (row.sig) {
+    const [label, t] = SIGNAL[row.sig.kind] ?? ['Signal', 'muted']
+    lines.push([chip(label, t), seg(`  ${hhmm(row.sig.at)}${row.sig.reqId ? `  ${row.sig.reqId}` : ''}${row.st ? `  in ${nameOf(row.st)}` : ''}`, P.text3)], ...wrap(row.sig.text, w, P.text), [])
+    lines.push(...signalContext(row.sig, w))
+  }
+  return lines
+}
+
+function helpLines(w) {
+  const rows = [
+    ['tab / ← →', 'move between columns'], ['↑ ↓ or j k', 'move in a list'], ['[ ]', 'previous / next session'], ['S', 'fold the sessions column'],
+    ['1 2 3 4', 'activity · plan · tests · preview (opens the middle column)'], ['6 7', 'files this session created · findings'], ['M', 'footprint: memory, files, Principia\'s own spend'], ['P', 'the project: every session, what stops it shipping'],
+    ['0', 'fold the middle column'], ['5', 'show / fold needs-you'], ['/', 'search requirements'], ['F', 'cycle the requirements filter'],
+    ['a d x', 'accept as verified · defer · resolve or dismiss'], ['f', 'refine the selected requirement'], ['c i n', 'comment on activity · redirect the agent · new requirement'], ['g', 'ask the agent to close the gaps'],
+    ['o t', 'open a diff in your editor · in the terminal'], ['A v', 'all activity · everything, not only key events'], ['C', 'show / hide the completion audit'], ['l h', 'light or dark · headless sessions'], ['?', 'close this help'], ['q', 'quit'],
+  ]
+  const lines = [[seg('KEYS', P.text2, undefined, true)], []]
+  for (const [k, what] of rows) lines.push([key(k.padEnd(12)), seg(what, P.text2)])
+  return lines
 }
 
 function render() {
@@ -588,16 +745,20 @@ function render() {
   const st = sessions.get(cur)?.state
   const state = !st ? seg('no session', P.text3) : st.imported ? seg('imported · read-only until reopened', P.warn)
     : !isLive(st) ? seg('not running · nothing can be sent', P.warn) : st.isWorking ? seg('● working', P.active) : seg('○ idle', P.done)
-  const rows = [{ line: [seg(' Principia - Your Claude Code Dashboard ', P.text, undefined, true), seg('  '), seg(` ${st ? `${projectOf(st)} · ${nameOf(st)}` : ''}`, P.text2), seg('   '), state,
-    seg(`   ${L.length} requirements · `, P.text3), seg(`${verified} verified`, P.done)] }, { line: [] }]
+  const needs = openSignals().length
+  const guard = S.guard
+  const rows = [{ line: [seg(' Principia ', P.text, undefined, true), seg('  '), seg(st ? `${projectOf(st)} · ${nameOf(st)}` : '', P.text2), seg(st?.kind ? `  ${KINDS[st.kind]}` : '', P.text3), seg('   '), state,
+    seg(`   ${L.length} requirements · `, P.text3), seg(`${verified} verified`, P.done), ...(needs ? [seg(` · ${needs} need${needs === 1 ? 's' : ''} you`, P.warn)] : []),
+    ...(guard ? [seg(guard.editsSince ? `   ${guard.editsSince} edit${guard.editsSince === 1 ? '' : 's'} since tests passed${guard.passedAt ? ` ${hhmm(guard.passedAt)}` : ''}` : `   tests passed ${hhmm(guard.passedAt)}, no edits since`, guard.editsSince ? P.warn : P.done)] : [])] }, { line: [] }]
   const cols = layout(W)
-  const hasSignalsCol = cols.some(([c]) => c === 'signals')
-  if (!hasSignalsCol && focus === 'signals') { focus = 'middle'; middle = 'signals' }
-  if (hasSignalsCol && middle === 'signals') middle = 'activity'
+  const open = cols.map(([c]) => c)
+  if (focus === 'signals' && !open.includes('signals')) focus = 'reqs'
+  if (focus === 'middle' && !open.includes('middle') && !open.includes('stack')) focus = 'reqs'
+  if (focus === 'sessions' && !open.includes('sessions')) focus = 'reqs'
   const bodyH = H - 5
   const drawn = cols.map(([c, w]) => {
-    const lines = c === 'sessions' ? sessionLines(w) : c === 'reqs' ? reqLines(w) : c === 'signals' ? signalLines(w) : c === 'middle' ? middleLines(w, !hasSignalsCol)
-      : c === 'detail' ? detailLines(w) : [...(focus === 'reqs' ? reqLines(w) : middleLines(w, true)), [], ...detailLines(w)]
+    const lines = c === 'sessions' ? sessionLines(w) : c === 'reqs' ? reqLines(w) : c === 'signals' ? signalLines(w) : c === 'middle' ? middleLines(w, false)
+      : c === 'detail' ? detailLines(w) : [...(focus === 'reqs' ? reqLines(w) : focus === 'signals' ? signalLines(w) : middleLines(w, false)), [], ...detailLines(w)]
     return [column(lines, bodyH), w]
   })
   for (let y = 0; y < bodyH; y++) {
@@ -611,7 +772,7 @@ function render() {
       ...(compose.mode === 'comment' ? [] : [seg('  '), compose.interrupt ? chip('interrupt first', 'danger') : seg('ctrl-t interrupt first', P.text3)]),
       seg('  › ', P.active), seg(compose.text + '▏', P.text)]
   } else {
-    footer = [seg(flash || 'tab column · ↑↓ move · [ ] session · S sessions · C audit · A all activity · M footprint · / search · F filter · 1-5 tabs · x resolve/dismiss · l light/dark · h headless · q quit', flash ? P.active : P.text3)]
+    footer = [seg(flash || `? keys · tab column · [ ] session · 1-4 6 7 M P middle${prefs.showMiddle ? ' (0 folds it)' : ''} · 5 needs you${needs ? ` (${needs})` : ''} · q quit`, flash ? P.active : P.text3)]
   }
   rows.push({ line: [] }, { line: [seg('─'.repeat(W), P.border)] }, { line: footer })
   out.write('\x1b[H' + rows.map(r => r.raw ?? paint(r.line, W, P.bg)).join('\r\n') + '\x1b[0m')
@@ -647,7 +808,8 @@ function switchSession(step) {
 }
 
 function clampSel() {
-  const max = { reqs: shownReqs().length, signals: openSignals().length, activity: shownEvents().length, plan: S.plan?.length ?? 0, tests: testRuns().length, preview: previews().length, footprint: sessionList().length }
+  const max = { reqs: shownReqs().length, signals: openSignals().length, activity: shownEvents().length, plan: S.plan?.length ?? 0, tests: testRuns().length, preview: previews().length, footprint: sessionList().length,
+    files: sessionFiles().length, findings: findings().length, project: projectRows().rows.filter(x => !x.section).length }
   for (const k of Object.keys(sel)) sel[k] = Math.max(0, Math.min(sel[k], (max[k] ?? 1) - 1))
 }
 
@@ -709,6 +871,7 @@ function openDiff(ev, here) {
 // ---------- keys ----------
 
 const focusOrder = () => layout(out.columns || 120).map(([c]) => c).filter(c => ['sessions', 'reqs', 'signals', 'middle'].includes(c)).concat(layout(out.columns || 120).some(([c]) => c === 'stack') ? ['reqs', 'middle'] : [])
+const openMiddle = () => { prefs.showMiddle = true; savePrefs(); focus = 'middle' }
 
 function onKey(k) {
   if (compose?.mode === 'search') {
@@ -750,15 +913,20 @@ function onKey(k) {
     case ']': return switchSession(1)
     case '\x1b[A': case 'k': if (focus === 'sessions') return switchSession(-1); if (listOf()) sel[listOf()] = Math.max(0, sel[listOf()] - 1); if (focus === 'reqs') sel.activity = 0; break
     case '\x1b[B': case 'j': if (focus === 'sessions') return switchSession(1); if (listOf()) { sel[listOf()]++; clampSel() } if (focus === 'reqs') sel.activity = 0; break
-    case '1': middle = 'activity'; focus = 'middle'; break
-    case '2': middle = 'plan'; focus = 'middle'; break
-    case '3': middle = 'tests'; focus = 'middle'; break
-    case '4': middle = 'preview'; focus = 'middle'; break
-    case '5': if (order.includes('signals')) focus = 'signals'; else { middle = 'signals'; focus = 'middle' } break
+    case '1': middle = 'activity'; openMiddle(); break
+    case '2': middle = 'plan'; openMiddle(); break
+    case '3': middle = 'tests'; openMiddle(); break
+    case '4': middle = 'preview'; openMiddle(); break
+    case '6': middle = 'files'; openMiddle(); break
+    case '7': middle = 'findings'; openMiddle(); break
+    case 'P': middle = 'project'; openMiddle(); break
+    case '0': prefs.showMiddle = false; savePrefs(); if (focus === 'middle') focus = 'reqs'; break
+    case '5': prefs.showNeedsYou = !prefs.showNeedsYou; savePrefs(); focus = prefs.showNeedsYou ? 'signals' : 'reqs'; break
+    case '?': help = !help; break
     case 'S': prefs.showSessions = !prefs.showSessions; savePrefs(); if (focus === 'sessions') focus = 'reqs'; break
     case 'C': prefs.showAudit = !prefs.showAudit; savePrefs(); say(prefs.showAudit ? 'Completion audit shown' : 'Completion audit hidden · C brings it back'); return
     case 'A': allActivity = !allActivity; sel.activity = 0; break
-    case 'M': middle = 'footprint'; focus = 'middle'; checkBackup(); break
+    case 'M': middle = 'footprint'; openMiddle(); checkBackup(); break
     case 'h': prefs.showHeadless = !prefs.showHeadless; savePrefs(); say(prefs.showHeadless ? 'Showing headless (claude -p) sessions' : 'Hiding headless sessions'); return
     case 'l': prefs.dark = !isDark(); savePrefs(); break
     case 'v': showAll = !showAll; sel.activity = 0; break

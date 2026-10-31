@@ -15,6 +15,13 @@ Principia keeps those apart:
 - **Signals.** Tool calls that failed or were refused, and things the agent found that were new or unexpected, in one column so you don't have to dig through the chat. Each keeps its context: the requirement, your message that started the turn, what the agent ran and the first of what came back.
 - **Conflicts.** When a later message contradicts an earlier requirement, or the agent's work goes against one, the requirement is flagged until you resolve it, and the agent is told to ask you which wins. A deliberate change ("actually, drop the search box") usually counts as a refinement instead; the line between the two is a judgment call, so now and then a correction is flagged as a conflict, and `x` settles it.
 - **Footprint.** Each session's memory right now (its process and everything it started) and the files it leaves: its transcript, its ledger, a folder of its own, the project files it changed, its temp folder and what its commands downloaded or cloned, each with how long it stays and whether Time Machine has it. Files its shell commands wrote to (`> file`, `tee`, `sed -i`) count as edits too; changes a script made show up as the project's uncommitted changes. A scratch folder several sessions share is counted once. What git ignores in the project is shown once as shared, not charged to a session, split into dependencies and build output (an install remakes them) and data the project's own commands wrote (nothing remakes it); the computer's package, model and browser caches are shown once too. Conductor and Cursor worktrees count as a session's own folder. The apps themselves (Claude, Claude Code, Conductor, Cursor) get their own block: their memory right now, all processes, and what they keep for their own use (installs, VM images, logs, databases). Sessions that are not running are not measured; a running one measures its whole recorded activity, so it counts files it changed before Principia was updated. `M` in the window.
+- **Steps apart from requirements.** A one-off action ("commit this", "bump the version", "run the import") is tagged as a step and kept out of the requirements list and its counts (`F` cycles to *Steps* to see them). What is left reads like a spec of the product.
+- **Needs you.** One column for what only you can do: a decision the agent asked for, something it cannot run or grant itself (a release command, an approval), a check by hand, a conflict, a failure. Each appears once however many turns repeat it, and clears itself when its requirement moves on. The agent's commentary about its own work is not in it (findings have their own view, `7`, and fade after a few turns).
+- **The project, and what stops it shipping.** `P` merges every session of the project into one list: what must be done before the first version ships, what is waiting on you, what is done but not verified, what can ship later, and when something last shipped (a passing push, release, deploy or publish). `/ledger ship R12 later` moves a requirement between the lists; `/ledger brief` writes the same as a file to start a new session from.
+- **Regression guard.** The header shows how many edits have happened since the last passing test run. When a session goes idle after editing with no test since, the agent is told once to run the project's tests (the last command that passed) before moving on.
+- **Research and writing sessions.** A session is classified as code, research or writing from what it does. In research and writing, "verified" needs the sources behind an answer (the agent attaches them) and an audit by a different model: `/ledger audit` sends each done requirement with its sources and the agent's answers to Sonnet as an adversarial auditor, and only cleared items with sources become verified; the auditor's note stays on the rest.
+- **Files, explained.** `6` lists the files the session created (written for the first time, or downloaded), each with why it was made, what it contains and what it is for now, described by Haiku from the file's first lines and your message at the time.
+- **Principia's own spend.** Every model call the plugin makes is counted: per session and all-time, calls and tokens (exact when reported, else estimated from text), with a cost at Haiku's rate. In the footprint view.
 - **Kept on task.** Every message you send carries what earlier messages asked that is not started or still under way, so a new message does not make the agent drop the last one. When a session goes idle with an ask of yours never started, the agent is told once to continue with it, or to set its status with the reason.
 - **Verify, nudged. When a session goes idle with requirements the agent says are done but nothing has checked, Principia asks it, once per requirement per session, to run the command that proves each one, or to say what a person should check when nothing can be run. `/ledger nudge off` stops that.
 - **Plan, Tests and Preview.** The agent's todo list with each step linked to the requirements it serves (and the ones it leaves out), every test or build run with the requirements it's evidence for, and the dev servers or preview links its commands printed.
@@ -96,7 +103,19 @@ Downloads the `principia` program for your system from this repository's GitHub 
 
 ### `/ledger nudge on` · `/ledger nudge off`
 
-Whether Principia prompts the agent on its own: to continue with an ask of yours it never started, and to verify requirements it says are done. On by default: when a turn ends and the session stays idle for 20 seconds with such requirements, the agent is asked once per requirement to run the command that proves it, or to record what a person should check when nothing can be run (that requirement is then left alone). `g` in the window asks at any time.
+Whether Principia prompts the agent on its own: to continue with an ask of yours it never started, to run the tests after edits, and to verify requirements it says are done. On by default: when a turn ends and the session stays idle for 20 seconds with such requirements, the agent is asked once per requirement to run the command that proves it, or to record what a person should check when nothing can be run (that requirement is then left alone). `g` in the window asks at any time.
+
+### `/ledger audit [R12 R14 …]`
+
+Research and writing sessions: an adversarial audit by a different model (Sonnet) of each requirement that is done but not verified, or of the ones named. Each is judged with the sources the agent attached and its answers; cleared items with sources become verified, the others keep the auditor's note. One model call per run.
+
+### `/ledger brief`
+
+Writes a markdown brief of the project across all its sessions: what must be done before the first version ships, what is waiting on you, what is done but not verified, what can ship later, what shipped last, and what is verified. Saved in `~/.claude/principia/brief-<project>.md`, to paste into a new session.
+
+### `/ledger ship R12 first` · `/ledger ship R12 later`
+
+Whether the first version can ship without a requirement. Open requirements are "first" unless marked.
 
 ### `/ledger refresh`
 
@@ -140,7 +159,10 @@ Titled **Principia - Your Claude Code Dashboard**. Sessions are listed by projec
 | `A` | Activity for the selected requirement only · all activity |
 | `M` | Footprint: each session's memory and files, with how long they stay and whether they're backed up |
 | `1`–`5` | Activity, Plan, Tests, Preview, Signals |
-| `/` · `F` | Search requirements · cycle the filter (open, done but not verified, verified, to revisit, conflicts, yours, the agent's) |
+| `/` · `F` | Search requirements · cycle the filter (open, before the first version ships, done but not verified, verified, to revisit, conflicts, yours, the agent's, steps) |
+| `1 2 3 4` · `6` · `7` · `M` · `P` · `0` | Open the middle column on activity, plan, tests, preview, files, findings, footprint or the project · `0` folds it |
+| `5` | Show or fold the needs-you column |
+| `?` | All keys |
 | `c` or Enter | Comment on the selected event (the agent doesn't see it) · on a signal, go to its event · on a preview, open it |
 | `n` | New requirement · on a signal, make the signal one |
 | `f` | Refine the selected requirement |

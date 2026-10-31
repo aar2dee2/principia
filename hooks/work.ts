@@ -64,27 +64,38 @@ export function humanText(text: string): string {
 
 // ---------- shared by the pane and the window ----------
 
-export type ReqFilterName = 'all' | 'open' | 'unverified' | 'verified' | 'revisit' | 'conflicts' | 'yours' | 'agents'
+export type ReqFilterName = 'all' | 'open' | 'first' | 'unverified' | 'verified' | 'revisit' | 'conflicts' | 'yours' | 'agents' | 'steps'
 
 export const REQ_FILTERS: { value: ReqFilterName; label: string }[] = [
   { value: 'all', label: 'All' },
   { value: 'open', label: 'Open' },
+  { value: 'first', label: 'Before the first version ships' },
   { value: 'unverified', label: 'Done, not verified' },
   { value: 'verified', label: 'Verified' },
   { value: 'revisit', label: 'To revisit' },
   { value: 'conflicts', label: 'Conflicts' },
   { value: 'yours', label: 'Asked by you' },
   { value: 'agents', label: 'Added by the agent' },
+  { value: 'steps', label: 'Steps (one-off actions)' },
 ]
 
 export const isVerified = (r: Requirement) => r.status === 'verified' && !r.needsReverify
+
+// Ledgers from before steps were tagged: a one-off action reads like one. Only the wording of
+// an untagged requirement is judged; a tag from the tagger always wins.
+const STEP_RE = /^(commit|push (the|all|it|this)|bump|run (the |a |\/)?(tests?|build|script|command|import|ledger)|rerun|re-run|(re)?install (the |this )?plugin|restart|start a new|open the (window|dashboard|pane|terminal)|tell (me|the user)|create (a|the) (github )?release|release (it|the|v)|upload (the )?(binaries|assets|release)|check in|redo the import|delete .*(state|temp|tmp) files)/i
+export const isStep = (r: Pick<Requirement, 'step' | 'title'>) => (r.step !== undefined ? r.step : STEP_RE.test(r.title.trim()))
 
 export function filterReqs(reqs: Requirement[], query: string, filter: ReqFilterName): Requirement[] {
   const q = query.trim().toLowerCase()
   return reqs.filter(r => {
     if (q && !`${r.id} ${r.title} ${r.history.map(h => h.text).join(' ')}`.toLowerCase().includes(q)) return false
+    // One-off steps (commit, push, run this) have a filter of their own and are hidden elsewhere.
+    if (filter === 'steps') return isStep(r)
+    if (isStep(r)) return false
     switch (filter) {
       case 'open': return !isVerified(r) && r.status !== 'deferred' && r.status !== 'revisit'
+      case 'first': return !isVerified(r) && r.status !== 'deferred' && r.status !== 'revisit' && r.ship !== 'later'
       case 'unverified': return r.status === 'implemented' || Boolean(r.needsReverify)
       case 'verified': return isVerified(r)
       case 'revisit': return r.status === 'revisit'
@@ -209,4 +220,57 @@ export function findCheck(events: ActivityEvent[], named: string): { pass: Activ
   if (latest.state === 'running') return { why: `"${cmd}" is still running; update again once it has finished` }
   if (latest.state === 'failed') return { why: `"${cmd}" last ran at ${hm(latest.at)} and failed; it has to exit 0` }
   return { why: `"${cmd}" last passed at ${hm(latest.at)}, before your last edit at ${hm(since)} (${lastEdit?.title ?? 'a file'}); run it again` }
+}
+
+// ---------- regression guard: edits since the last passing test ----------
+
+export type Guard = { command?: string; passedAt?: number; editsSince: number; edited: string[] }
+
+// Edits after the last passing test run (Edit/Write calls, and commands that name a file they
+// write to). No guard when the session has neither edited nor tested.
+export function guardOf(events: ActivityEvent[]): Guard | undefined {
+  const pass = [...events].reverse().find(e => e.kind === 'test' && e.state === 'ok')
+  const since = pass?.at ?? 0
+  const edits = events.filter(e => e.at > since && (e.kind === 'code' || ((e.kind === 'command') && /(^|[^<>&\d])>{1,2}\s*[^\s;&|]|\bsed\s+-i\b|\btee\s/.test(e.detail ?? ''))))
+  if (!pass && !edits.length) return undefined
+  const edited = [...new Set(edits.map(e => e.file ? e.file.split(/[\\/]/).pop() ?? e.file : e.title))].slice(0, 6)
+  return { command: pass?.detail ? squash(pass.detail).slice(0, 120) : undefined, passedAt: pass?.at, editsSince: edits.length, edited }
+}
+
+// ---------- what kind of session this is ----------
+
+export type SessionKind = 'code' | 'research' | 'writing'
+
+// From what the session did: code sessions edit files and run commands; research sessions
+// read the web and files; what is left is writing (or talk).
+export function sessionKind(events: ActivityEvent[]): SessionKind {
+  const n = (f: (e: ActivityEvent) => boolean) => events.filter(f).length
+  const code = n(e => e.kind === 'code' || e.kind === 'test')
+  const web = n(e => e.kind === 'discovery' && !/^(Read|Searched)/.test(e.title))
+  if (code >= 3 || (code >= 1 && code >= web)) return 'code'
+  if (web >= 2) return 'research'
+  return 'writing'
+}
+
+// ---------- shipping ----------
+
+const SHIP_RE = /\b(gh release (create|upload)|git push|npm publish|bun publish|pnpm publish|cargo publish|gem push|twine upload|vercel( --prod)?|netlify deploy|fly deploy|flyctl deploy|wrangler (deploy|publish)|docker push|kubectl apply|mix release|fastlane|eas (build|submit)|firebase deploy|railway up|heroku)\b/
+
+export type Ship = { at: number; title: string; command: string }
+
+// The last command that shipped something (a release, a push, a deploy) and passed.
+export function lastShip(events: ActivityEvent[]): Ship | undefined {
+  const ev = [...events].reverse().find(e => (e.kind === 'command' || e.kind === 'test') && e.state === 'ok' && SHIP_RE.test(e.detail ?? ''))
+  return ev ? { at: ev.at, title: ev.title, command: squash(ev.detail ?? '').slice(0, 120) } : undefined
+}
+
+// What stands between the work and shipping: requirements for the first version that are not
+// done, and what the person must do or decide. 'later' items are shown apart.
+export function shipGate(reqs: Requirement[], signals: { kind: string; reqId?: string; dismissed?: boolean; resolvedAt?: number; text: string }[]) {
+  const open = (r: Requirement) => r.status !== 'verified' && r.status !== 'revisit' && r.status !== 'deferred' && !isStep(r)
+  const first = reqs.filter(r => open(r) && r.ship !== 'later')
+  const later = reqs.filter(r => open(r) && r.ship === 'later')
+  const onYou = signals.filter(s => !s.dismissed && !s.resolvedAt && (s.kind === 'decision' || s.kind === 'blocker' || s.kind === 'manual' || s.kind === 'blocked'))
+  const unverified = reqs.filter(r => r.status === 'implemented' && !isStep(r))
+  return { first, later, onYou, unverified }
 }

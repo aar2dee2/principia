@@ -305,14 +305,17 @@ function footList() {
 function sharedList() {
   const byProject = new Map()
   let caches = null
+  let app = null
   for (const st of sessionList()) {
     const f = st.footprint
     if (!f) continue
     const key = st.cwd || projectOf(st)
     if (f.shared?.length && (!byProject.has(key) || byProject.get(key).at < f.at)) byProject.set(key, { at: f.at, name: projectOf(st), kb: f.sharedKb || 0, dataKb: f.sharedDataKb || 0, items: f.shared })
     if (f.caches?.length && (!caches || caches.at < f.at)) caches = { at: f.at, kb: f.cacheKb || 0, items: f.caches }
+    // The apps' own memory is live: only a running session's figure is current.
+    if ((f.app?.length || f.appRam?.length) && (!app || app.at < f.at)) app = { at: f.at, live: isLive(st), ram: f.appRam ?? [], kb: f.appKb || 0, items: f.app ?? [] }
   }
-  return { projects: [...byProject.values()].sort((a, b) => b.kb - a.kb), caches }
+  return { projects: [...byProject.values()].sort((a, b) => b.kb - a.kb), caches, app }
 }
 
 function reqLines(w) {
@@ -414,6 +417,14 @@ function middleLines(w, withSignals) {
         if (pr.dataKb) lines.push(...wrap(`${pr.name}: ${fmtKb(pr.dataKb)} of data (${named(data)}): ${LIFETIME.data}.`, w, P.warn))
       }
       if (shared.caches) lines.push(...wrap(`Caches: ${fmtKb(shared.caches.kb)} (${shared.caches.items.slice(0, 4).map(i => `${i.path.replace(HOME, '~')} ${fmtKb(i.kb)}`).join(', ')}${shared.caches.items.length > 4 ? ', …' : ''}). ${LIFETIME.cache}.`, w, P.text2))
+    }
+    if (shared.app) {
+      const ram = shared.app.ram.reduce((n, a) => n + a.kb, 0)
+      lines.push([], [seg('THE APPS', P.text2, undefined, true), seg('  Claude, Claude Code, Conductor, Cursor: everything they hold, sessions included', P.text3)])
+      if (shared.app.ram.length) lines.push([seg('Memory ', P.text3), seg(fmtKb(ram), shared.app.live ? P.active : P.text3, undefined, true), seg(shared.app.live ? '' : ` as of ${hhmm(shared.app.at)}`, P.text3)],
+        ...wrap(shared.app.ram.map(a => `${a.name} ${fmtKb(a.kb)} in ${a.procs} process${a.procs === 1 ? '' : 'es'}`).join(' · '), w, P.text2, '  '))
+      if (shared.app.kb) lines.push([seg('On disk ', P.text3), seg(fmtKb(shared.app.kb), P.text, undefined, true), seg(`  ${LIFETIME.app}`, P.text3)],
+        ...shared.app.items.slice(0, 8).flatMap(i => wrap(`${i.path.replace(HOME, '~')} ${fmtKb(i.kb)}`, w, P.text3, '  ')))
     }
     lines.push([], ...wrap(`Own files are a session's transcript (~/.claude/projects, ${LIFETIME.transcript(keepDays)}), its ledger (~/.claude/principia, ${LIFETIME.ledger}), the project files it changed, its temp folder and what it downloaded. A folder is the session's own: ${LIFETIME.scratch}, or ${LIFETIME.worktree}. Sessions that ran before this version report only the first two.`, w, P.text3))
     lines.push([], ...wrap(backup.latest ? `Time Machine's last backup: ${backup.latest}. Nothing here is synced anywhere else.` : backup.checked ? 'No Time Machine backup found: these files exist on this computer only.' : 'Checking for a Time Machine backup…', w, backup.latest ? P.text3 : P.warn))

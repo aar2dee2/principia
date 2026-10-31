@@ -3,7 +3,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { Requirement } from '../types'
 import { filterReqs, findCheck, gapOf, humanText, linkStep, linker, planFrom, previewUrls, trimEvents } from '../hooks/work'
 import { parseReview, parseTagged } from '../hooks/tagging'
-import { cacheDirs, changedPaths, duKb, duLines, fetchedPaths, fmtKb, ignoredPaths, roleOf, sumKb, treeRss, workspaceOf, writtenPaths } from '../hooks/footprint'
+import { appDirs, appRss, cacheDirs, changedPaths, duKb, duLines, fetchedPaths, fmtKb, ignoredPaths, roleOf, sumKb, treeRss, workspaceOf, writtenPaths } from '../hooks/footprint'
 
 const req = (id: string, title: string, extra: Partial<Requirement> = {}): Requirement => ({
   id, title, status: 'captured', at: 1, history: [{ at: 1, text: title, kind: 'original', by: 'you' }], evidence: [], ...extra,
@@ -209,6 +209,22 @@ describe('footprint', () => {
     expect(['/p/pipeline/jobs', '/p/.context', '/p/models'].map(roleOf)).toEqual(['data', 'data', 'data'])
     expect(cacheDirs('/h', 'mac')).toContain('/h/.cache/torch')
     expect(cacheDirs('/h', 'mac')).toContain('/h/Library/Caches/ms-playwright')
+  })
+  test("the apps' memory is grouped by app from each process's path", () => {
+    const ps = [
+      '1000 /Applications/Claude.app/Contents/MacOS/Claude',
+      ' 500 /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper',
+      ' 300 /Users/u/Library/Application Support/Claude/claude-code/2.1.308/abc/claude.app/Contents/MacOS/claude',
+      ' 200 /Users/u/Library/Application Support/Claude/claude-code/2.1.308/abc/claude.app/Contents/MacOS/claude',
+      '  50 /Users/u/.claude/principia/bin/0.5.4-principia-darwin-arm64',
+      ' 700 /Applications/Conductor.app/Contents/MacOS/Conductor',
+      '9999 /usr/bin/something-else',
+    ].join('\n')
+    expect(appRss(ps)).toEqual([
+      { name: 'Claude app', procs: 2, kb: 1500 }, { name: 'Conductor', procs: 1, kb: 700 }, { name: 'Claude Code sessions', procs: 2, kb: 500 }, { name: 'Principia window', procs: 1, kb: 50 },
+    ])
+    expect(appDirs('/h', 'mac')).toContain('/h/Library/Application Support/Claude/vm_bundles')
+    expect(appDirs('/h', 'linux')).not.toContain('/h/Library/Application Support/Claude/vm_bundles')
   })
   test('uncommitted changes come from git status, renames by their new name', () => {
     expect(changedPaths(' M hooks/a.ts\n?? new dir/\nR  old.ts -> new.ts\n', '/p')).toEqual(['/p/hooks/a.ts', '/p/new dir', '/p/new.ts'])

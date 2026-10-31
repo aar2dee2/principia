@@ -23,7 +23,7 @@ import type { Complete, LedgerItem, PastPrompt, Progress, Tagged, Turn } from '.
 import { PLAN_TOOLS, REQ_FILTERS, failureText, filterReqs, findCheck, gapOf, humanText, isSecretPath, linker, planFrom, previewUrls, trimEvents } from './work'
 import type { ReqFilterName } from './work'
 import { RELEASE } from './release'
-import { FIND_SELF, SHARED_NAMES, cacheDirs, changedPaths, duKb, duLines, fetchedPaths, fmtKb, ignoredPaths, roleOf, sumKb, treeRss, workspaceOf, writtenPaths } from './footprint'
+import { FIND_SELF, SHARED_NAMES, appDirs, appRss, cacheDirs, changedPaths, duKb, duLines, fetchedPaths, fmtKb, ignoredPaths, roleOf, sumKb, treeRss, workspaceOf, writtenPaths } from './footprint'
 import type { Sized } from './footprint'
 import type { Footprint } from './footprint'
 import { EDITORS, LINUX, MAC, WINDOWS, base, firstLine, join, launchCommand, programName } from './platform'
@@ -635,6 +635,25 @@ async function nudgeVerify($: $T): Promise<number> {
   return due.length
 }
 
+// A message the agent answered without starting what it asked is the other way sessions stall:
+// the next message takes over, and the ask is forgotten. Once per requirement, when the session
+// goes idle with asks of yours never started, the agent is told to continue with them.
+async function nudgeOpen($: $T): Promise<number> {
+  if (hasEnded || (await $.store.get('nudge').catch(() => undefined)) === 'off') return 0
+  if (await read($, turnA)) return 0
+  const due = (await read($, reqsA)).filter(r => r.status === 'captured' && !r.pokedAt && r.history[0]?.by !== 'agent' && r.at < turnStartedAt)
+  if (!due.length) return 0
+  await update($, reqsA, list => list.map(r => (due.some(d => d.id === r.id) ? { ...r, pokedAt: now() } : r)))
+  await deliver(
+    $,
+    `[Ledger] Asked but not started: ${due.map(r => `${r.id} ${r.title}`).join('; ')}. ` +
+      `Continue with them now. If one cannot be done yet, set its status with the ${TOOL} tool (blocked, needs_clarification or revisit) and say why.`,
+    { interrupt: false, start: true },
+  )
+  await save($)
+  return due.length
+}
+
 // A requirement the agent (or a refinement from you) takes out of "done" is nudged again the
 // next time it gets there. Haiku's own re-judgements don't count: they flip statuses back and
 // forth, and each flip used to bring the same nudge again.
@@ -858,6 +877,8 @@ async function measureFootprint($: $T, files: boolean) {
   if (!selfPid) selfPid = Number(firstLine((await run($, ['sh', '-c', FIND_SELF]))?.stdout)) || 0
   const ps = await run($, ['ps', '-axo', 'pid=,ppid=,rss='])
   const { procs, ramKb } = selfPid && ps?.stdout ? treeRss(ps.stdout, selfPid) : { procs: 0, ramKb: 0 }
+  // The apps' memory as a whole (every Claude, Claude Code, Conductor and Cursor process).
+  const appRam = appRss((await run($, ['ps', '-axo', 'rss=,comm=']))?.stdout ?? '')
   const { at: _at, pid: _pid, procs: _procs, ramKb: _ram, ...kept } = prev ?? { transcriptKb: 0, ledgerKb: 0, workspaceKb: 0 }
   let disk: Omit<Footprint, 'at' | 'pid' | 'procs' | 'ramKb'> = kept
   const workspace = workspaceOf(sessionRoot)
@@ -887,6 +908,7 @@ async function measureFootprint($: $T, files: boolean) {
     const sharedPaths = sessionRoot ? (gitIgnored ? ignoredPaths(gitIgnored, sessionRoot) : SHARED_NAMES.map(n => join(sessionRoot, n))) : []
     const shared = (await sizes(sharedPaths)).map(x => ({ ...x, role: roleOf(x.path) }))
     const caches = await sizes(cacheDirs(home, plat.os, [plat.tmp]))
+    const app = await sizes(appDirs(home, plat.os))
     disk = {
       transcriptKb: transcript ? await size(transcript) : 0,
       ledgerKb: await size(stateFile()),
@@ -897,9 +919,10 @@ async function measureFootprint($: $T, files: boolean) {
       fetchedKb: sumKb(fetched), fetched: fetched.slice(0, 12),
       sharedKb: sumKb(shared), sharedDataKb: sumKb(shared.filter(x => x.role === 'data')), shared: shared.slice(0, 10),
       cacheKb: sumKb(caches), caches: caches.slice(0, 8),
+      appKb: sumKb(app), app: app.slice(0, 10),
     }
   }
-  await update($, footprintA, () => ({ at: now(), pid: selfPid || undefined, procs, ramKb, ...disk, workspace }))
+  await update($, footprintA, () => ({ at: now(), pid: selfPid || undefined, procs, ramKb, ...disk, appRam, workspace }))
   await mirror($)
 }
 
@@ -1363,6 +1386,15 @@ export const register: Register = on => {
     if (touched.length) {
       context.push(`[Ledger] Captured from this message:\n${touched.join('\n')}\nReport progress with the ${TOOL} tool.`)
     }
+    // A new message must not make the agent drop the last one: what earlier messages asked
+    // that is not started or still under way comes along with every message.
+    const justNow = new Set(touched.map(t => /^R\d+/.exec(t)?.[0] ?? ''))
+    const open = (await read($, reqsA)).filter(r => (r.status === 'captured' || r.status === 'in_progress') && !justNow.has(r.id) && r.history[0]?.by !== 'agent')
+    if (open.length) {
+      context.push(`[Ledger] Still open from earlier messages: ${open.slice(-8).map(r => `${r.id} ${r.title} (${r.status === 'captured' ? 'not started' : 'in progress'})`).join('; ')}. ` +
+        'Finish them in this turn as well, after what this message asks, unless this message changes or cancels them; ' +
+        `if one has to wait, set its status (blocked, needs_clarification or revisit) with the reason, using the ${TOOL} tool.`)
+    }
     if (conflicts.length) {
       context.push(`[Ledger] This message conflicts with earlier requirements: ${conflicts.map(c => `${c.id} (${c.reason})`).join('; ')}. Ask the user which one wins before acting on either.`)
     }
@@ -1457,7 +1489,7 @@ export const register: Register = on => {
           // turns, every open requirement is re-judged against the whole session so far.
           if (turns.length % CONSOLIDATE_EVERY === 0) await consolidate($)
           // Then, if the session stays idle, the agent is asked to verify what it says is done.
-          $.clock.after(NUDGE_AFTER, () => void nudgeVerify($).catch(() => undefined))
+          $.clock.after(NUDGE_AFTER, () => void nudgeOpen($).then(n => (n ? 0 : nudgeVerify($))).catch(() => undefined))
         }))
       }
       await update($, repliesA, list => list.map(r => (r.delivery === 'received' ? { ...r, delivery: 'acted' as const } : r)))

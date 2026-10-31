@@ -37,7 +37,47 @@ export type Footprint = {
   // Package caches shared by everything on this computer, which installs fill.
   cacheKb?: number
   caches?: Sized[]
+  // The apps themselves: what Claude, Claude Code, Conductor and Cursor hold in memory right
+  // now (all their processes, sessions included) and keep on disk for their own use (installs,
+  // VM images, logs, their own databases). Counted once for the computer.
+  appRam?: AppRam[]
+  appKb?: number
+  app?: Sized[]
 }
+
+export type AppRam = { name: string; procs: number; kb: number }
+
+// `ps -axo rss=,comm=` → memory by app, from each process's path.
+const APPS: [string, RegExp][] = [
+  ['Claude app', /Claude\.app\//],
+  ['Claude Code sessions', /claude-code\/[^ ]*\/claude$|\/\.claude\/local\/|\/claude$/],
+  ['Principia window', /principia-(darwin|linux|windows)/],
+  ['Conductor', /Conductor\.app\/|com\.conductor/],
+  ['Cursor', /Cursor\.app\/|cursor-agent/],
+]
+export function appRss(ps: string): AppRam[] {
+  const out = new Map<string, AppRam>()
+  for (const line of ps.split('\n')) {
+    const m = /^\s*(\d+)\s+(.+?)\s*$/.exec(line)
+    if (!m) continue
+    const app = APPS.find(([, re]) => re.test(m[2] as string))?.[0]
+    if (!app) continue
+    const cur = out.get(app) ?? { name: app, procs: 0, kb: 0 }
+    out.set(app, { ...cur, procs: cur.procs + 1, kb: cur.kb + Number(m[1]) })
+  }
+  return [...out.values()].sort((a, b) => b.kb - a.kb)
+}
+
+// What the apps keep for themselves, outside any session's files.
+export const appDirs = (home: string, os: 'mac' | 'linux' | 'windows'): string[] => [
+  `${home}/.claude/skills`, `${home}/.claude/plugins`, `${home}/.claude/file-history`, `${home}/.claude/telemetry`, `${home}/.claude/shell-snapshots`, `${home}/.claude/cache`, `${home}/.claude/local`,
+  `${home}/.local/share/claude`, `${home}/.cursor`, `${home}/conductor/archived-contexts`,
+  ...(os === 'mac' ? [
+    `${home}/Library/Application Support/Claude/vm_bundles`, `${home}/Library/Application Support/Claude/claude-code`, `${home}/Library/Application Support/Claude/claude-code-vm`,
+    `${home}/Library/Application Support/Claude/local-agent-mode-sessions`, `${home}/Library/Application Support/Claude/claude-code-sessions`,
+    `${home}/Library/Logs/Claude`, `${home}/Library/Caches/claude-cli-nodejs`, `${home}/Library/Application Support/com.conductor.app`,
+  ] : [`${home}/.config/Claude`, `${home}/.cache/claude-cli-nodejs`]),
+]
 
 export type Sized = { path: string; kb: number; role?: 'deps' | 'data' }
 
@@ -197,6 +237,7 @@ export const LIFETIME = {
   shared: 'dependencies and build output in the project, shared by every session on it: an install or build makes them again',
   data: 'written in the project by its own commands and ignored by git, so nothing remakes it: yours to judge before deleting',
   cache: 'package, model and browser caches shared by everything on this computer: the next install or download refills them',
+  app: 'the apps\' own installs, images, logs and databases: managed by the apps, not by any session',
 } as const
 
 // The shell that finds the Claude Code process this hook runs in: walks up from the shell's

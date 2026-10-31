@@ -38,6 +38,8 @@ export type Requirement = {
   nudgedAt?: number
   // Nothing can be run to verify this: what a person should check instead (status 'implemented').
   manual?: string
+  // When the agent was told to continue with this ask it had not started (status 'captured').
+  pokedAt?: number
 }
 
 // Things worth acting on that are easy to miss in the chat: a tool call that failed or was
@@ -86,6 +88,9 @@ export type Footprint = {
   shared?: { path: string; kb: number; role?: 'deps' | 'data' }[]
   cacheKb?: number
   caches?: { path: string; kb: number }[]
+  appRam?: { name: string; procs: number; kb: number }[]
+  appKb?: number
+  app?: { path: string; kb: number }[]
 }
 
 export type EventKind = 'discovery' | 'plan' | 'code' | 'command' | 'test' | 'message'

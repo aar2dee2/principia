@@ -3,7 +3,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import type { Requirement } from '../types'
 import { filterReqs, findCheck, gapOf, guardOf, humanText, lastShip, linkStep, linker, planFrom, previewUrls, sessionKind, shipGate, trimEvents } from '../hooks/work'
 import { parseAudit, parseFiles, parseReview, parseTagged } from '../hooks/tagging'
-import { appDirs, appRss, cacheDirs, changedPaths, duKb, duLines, fetchedPaths, fmtKb, ignoredPaths, roleOf, sumKb, treeRss, workspaceOf, writtenPaths } from '../hooks/footprint'
+import { appDirs, appRss, cacheDirs, changedPaths, duKb, duLines, fetchedPaths, findCreatedArgs, fmtKb, ignoredPaths, roleOf, statLines, sumKb, touchStamp, treeRss, workspaceOf, writtenPaths } from '../hooks/footprint'
 
 const req = (id: string, title: string, extra: Partial<Requirement> = {}): Requirement => ({
   id, title, status: 'captured', at: 1, history: [{ at: 1, text: title, kind: 'original', by: 'you' }], evidence: [], ...extra,
@@ -225,6 +225,15 @@ describe('footprint', () => {
     ])
     expect(appDirs('/h', 'mac')).toContain('/h/Library/Application Support/Claude/vm_bundles')
     expect(appDirs('/h', 'linux')).not.toContain('/h/Library/Application Support/Claude/vm_bundles')
+  })
+  test('created files are found by birth time after a stamped reference, skipping dependency folders', () => {
+    expect(touchStamp(new Date(2026, 9, 31, 9, 5, 7).getTime())).toBe('202610310905.07')
+    const args = findCreatedArgs('/p', '/d/since-x', 'mac')
+    expect(args.slice(0, 2)).toEqual(['find', '/p'])
+    expect(args).toContain('-newerBm')
+    expect(args).toContain('node_modules')
+    expect(findCreatedArgs('/p', '/d/since-x', 'linux')).toContain('-newer')
+    expect(statLines('1793439160 /p/a.csv\n1793439200 /p/with space.sql\n')).toEqual([{ at: 1793439160000, path: '/p/a.csv' }, { at: 1793439200000, path: '/p/with space.sql' }])
   })
   test('uncommitted changes come from git status, renames by their new name', () => {
     expect(changedPaths(' M hooks/a.ts\n?? new dir/\nR  old.ts -> new.ts\n', '/p')).toEqual(['/p/hooks/a.ts', '/p/new dir', '/p/new.ts'])

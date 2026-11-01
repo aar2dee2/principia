@@ -303,12 +303,12 @@ export type FileNote = { path: string; why: string; contains: string; use: strin
 
 export const FILES_SYSTEM =
   'You describe files an AI coding agent created during a work session, for the person it works for. For each file you get its path, the start of its contents, ' +
-  'and the message the person had sent when it was created. Reply with JSON only: {"files":[{"path":string,"why":string,"contains":string,"use":string}]}. ' +
+  'the message the person had sent when it was created, and the command or tool call that made it when known. Reply with JSON only: {"files":[{"path":string,"why":string,"contains":string,"use":string}]}. ' +
   'why: why it was created, one short sentence. contains: what is in it, one short sentence (say "binary" or "empty" when so). ' +
   'use: what it is for in this session now: "part of the product", "a test", "a one-off script", "scratch output", "a report for the person", "a download", "unknown". Plain words, no speculation beyond the contents.'
 
-export function filesPrompt(files: { path: string; head: string; ask: string }[]): string {
-  return files.map(f => `### ${f.path}\nMessage at the time: ${f.ask.slice(0, 400) || '(none)'}\nContents start:\n${f.head.slice(0, 1600)}`).join('\n\n')
+export function filesPrompt(files: { path: string; head: string; ask: string; madeBy?: string }[]): string {
+  return files.map(f => `### ${f.path}\nMessage at the time: ${f.ask.slice(0, 400) || '(none)'}\nMade by: ${f.madeBy?.slice(0, 600) || '(not known)'}\nContents start:\n${f.head.slice(0, 1600)}`).join('\n\n')
 }
 
 export function parseFiles(reply: string): FileNote[] {

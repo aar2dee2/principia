@@ -84,9 +84,11 @@ export type Usage = { calls: number; tokensIn: number; tokensOut: number; estima
 export type SessionFile = {
   path: string
   at: number
-  kind: 'written' | 'downloaded'
+  kind: 'written' | 'downloaded' | 'found'
   kb?: number
   eventId?: string
+  // The command or tool call that produced it, when known.
+  madeBy?: string
   why?: string
   contains?: string
   use?: string

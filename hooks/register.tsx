@@ -25,7 +25,7 @@ import type { Complete, LedgerItem, PastPrompt, Progress, Tagged, Turn } from '.
 import { PLAN_TOOLS, REQ_FILTERS, failureText, filterReqs, findCheck, gapOf, guardOf, humanText, isSecretPath, isStep, lastShip, linker, planFrom, previewUrls, sessionKind, shipGate, trimEvents } from './work'
 import type { ReqFilterName } from './work'
 import { RELEASE } from './release'
-import { FIND_SELF, SHARED_NAMES, appDirs, appRss, cacheDirs, changedPaths, duKb, duLines, fetchedPaths, fmtKb, ignoredPaths, roleOf, sumKb, treeRss, workspaceOf, writtenPaths } from './footprint'
+import { FIND_SELF, SHARED_NAMES, appDirs, appRss, cacheDirs, changedPaths, duKb, duLines, fetchedPaths, findCreatedArgs, fmtKb, ignoredPaths, roleOf, statLines, sumKb, touchStamp, treeRss, workspaceOf, writtenPaths } from './footprint'
 import type { Sized } from './footprint'
 import type { Footprint } from './footprint'
 import { EDITORS, LINUX, MAC, WINDOWS, base, firstLine, join, launchCommand, programName } from './platform'
@@ -446,6 +446,30 @@ async function snapshot($: $T, ev: ActivityEvent) {
 
 // ---------- the files a session created, and what each is for ----------
 
+// Files born in the session's folder after the session began (birth time on macOS, mtime
+// elsewhere), plus files git does not track there. Dependency, build and cache folders are
+// skipped, and so are files that may hold secrets. The ledger's own edit events say which of
+// the mtime matches were edits of existing files rather than new ones.
+async function createdSince($: $T, root: string, since: number): Promise<{ path: string; at: number }[]> {
+  if (plat.os === 'windows') return []
+  const ref = join(plat.data, `since-${sessionId}`)
+  await $.fs.write(ref, '').catch(() => undefined)
+  await run($, ['touch', '-t', touchStamp(since), ref])
+  const byFind = ((await run($, findCreatedArgs(root, ref, plat.os), 60_000))?.stdout ?? '').split('\n').map(l => l.trim()).filter(Boolean)
+  const untracked = ((await run($, ['git', '-C', root, 'ls-files', '--others', '--exclude-standard']))?.stdout ?? '').split('\n').map(l => l.trim()).filter(Boolean).map(l => join(root, l))
+  const events = await read($, eventsA)
+  const editedExisting = new Set(events.filter(e => e.kind === 'code' && e.file).map(e => e.file as string))
+  const created = (await read($, filesA)).map(f => f.path)
+  const paths = [...new Set([...byFind, ...untracked])]
+    .filter(p => !isSecretPath(p) && !/\/\.DS_Store$|\/since-|state-.*\.json$/.test(p))
+    .filter(p => plat.os === 'mac' || !editedExisting.has(p) || created.includes(p))
+    .slice(0, 300)
+  if (!paths.length) return []
+  const stat = (await run($, ['sh', '-c', plat.os === 'mac' ? 'stat -f "%m %N" "$@" 2>/dev/null' : 'stat -c "%Y %n" "$@" 2>/dev/null', 'sh', ...paths], 30_000))?.stdout ?? ''
+  const times = new Map(statLines(stat).map(x => [x.path, x.at]))
+  return paths.map(p => ({ path: p, at: times.get(p) ?? now() }))
+}
+
 // Once every files pass, the files created since the last description are read (their first
 // lines) and described in one Haiku call: why each was made, what it holds, what it is for now.
 async function describeFiles($: $T) {
@@ -454,7 +478,18 @@ async function describeFiles($: $T) {
   if (!todo.length) return
   const turns = await read($, turnsA)
   const askAt = (at: number) => [...turns].reverse().find(t => t.at <= at)?.ask ?? ''
-  const heads: { path: string; head: string; ask: string }[] = []
+  const events = await read($, eventsA)
+  // What produced the file: the tool call that wrote it, else the last command naming it.
+  const madeBy = (f: SessionFile) => {
+    if (f.madeBy) return f.madeBy
+    if (f.kind === 'downloaded') return 'a download by a shell command'
+    const ev = f.eventId ? events.find(e => e.id === f.eventId) : undefined
+    if (ev) return `${ev.title} (${ev.kind === 'code' ? 'the agent wrote it with its editor tool' : 'a command'})`
+    const name = base(f.path)
+    const cmd = [...events].reverse().find(e => (e.kind === 'command' || e.kind === 'test') && e.at <= f.at + 60_000 && (e.detail ?? '').includes(name))
+    return cmd ? `command: ${clip(cmd.detail ?? cmd.title, 500)}` : ''
+  }
+  const heads: { path: string; head: string; ask: string; madeBy?: string }[] = []
   for (const f of todo) {
     let head = ''
     try {
@@ -463,7 +498,7 @@ async function describeFiles($: $T) {
     } catch {
       head = '(could not be read; it may have been deleted)'
     }
-    heads.push({ path: f.path, head, ask: askAt(f.at) })
+    heads.push({ path: f.path, head, ask: askAt(f.at), madeBy: madeBy(f) })
   }
   const prompt = filesPrompt(heads)
   const res = await $.model.complete({ model: HAIKU, system: FILES_SYSTEM, prompt, maxTokens: 1500 })
@@ -1034,11 +1069,15 @@ async function measureFootprint($: $T, files: boolean) {
     const shared = (await sizes(sharedPaths)).map(x => ({ ...x, role: roleOf(x.path) }))
     const caches = await sizes(cacheDirs(home, plat.os, [plat.tmp]))
     const app = await sizes(appDirs(home, plat.os))
-    // Downloads join the session's files; every created file gets its size.
+    // Downloads join the session's files, and so does whatever appeared in the session's folder
+    // since it began (a CSV a script wrote, a database a query made): found by birth time, and,
+    // in a git repository, by being untracked. Every created file gets its size.
+    const found = sessionRoot ? await createdSince($, sessionRoot, Math.min(now(), ...events.map(e => e.at))) : []
     await update($, filesA, list => {
       const out = [...list]
       for (const f of fetched) if (!out.some(x => x.path === f.path)) out.push({ path: f.path, at: now(), kind: 'downloaded' })
-      return out
+      for (const f of found) if (!out.some(x => x.path === f.path)) out.push({ path: f.path, at: f.at, kind: 'found' })
+      return out.slice(-400)
     })
     const fileSizes = await sizes((await read($, filesA)).map(f => f.path))
     await update($, filesA, list => list.map(f => ({ ...f, kb: fileSizes.find(x => x.path === f.path)?.kb ?? f.kb })))

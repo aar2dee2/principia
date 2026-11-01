@@ -373,7 +373,7 @@ function middleLines(w, withSignals) {
     const list = sessionFiles()
     const total = list.reduce((n, f) => n + (f.kb || 0), 0)
     lines.push([seg(`${list.length} file${list.length === 1 ? '' : 's'} created by this session`, P.text2), seg(total ? ` · ${fmtKb(total)}` : '', P.text3)])
-    if (!list.length) lines.push(...wrap('Nothing yet. Files the agent writes for the first time, and downloads, are listed here with why each was made and what it is for.', w, P.text3))
+    if (!list.length) lines.push(...wrap('Nothing yet. Files the agent writes, files its scripts and commands leave in the session folder, and downloads are listed here with why each was made and what it is for.', w, P.text3))
     list.forEach((f, i) => {
       const name = shortPath(f.path, w - 14)
       lines.push({ sel: isSel('files', i), line: [seg(isSel('files', i) ? '› ' : '  ', P.active), seg(name, P.text), seg(f.kb !== undefined ? `  ${fmtKb(f.kb)}` : '', P.text3)] })
@@ -511,7 +511,8 @@ function detailLines(w) {
   if (focus === 'middle' && middle === 'files') {
     const f = sessionFiles()[sel.files]
     if (!f) return lines
-    lines.push(...wrap(f.path.replace(HOME, '~'), w, P.text), [seg(`${f.kind === 'downloaded' ? 'Downloaded' : 'Written'} ${hhmm(f.at)}${f.kb !== undefined ? ` · ${fmtKb(f.kb)}` : ''}`, P.text3)], [])
+    lines.push(...wrap(f.path.replace(HOME, '~'), w, P.text), [seg(`${f.kind === 'downloaded' ? 'Downloaded' : f.kind === 'found' ? 'Appeared in the session folder' : 'Written by the agent'} ${hhmm(f.at)}${f.kb !== undefined ? ` · ${fmtKb(f.kb)}` : ''}`, P.text3)], [])
+    if (f.madeBy) lines.push(...wrap(`Made by: ${f.madeBy}`, w, P.text3))
     if (f.why === undefined) lines.push(...wrap('Being described: Principia reads the start of the file and asks Haiku why it was made and what it is for.', w, P.text3))
     else {
       lines.push([seg('Why', P.text3)], ...wrap(f.why || 'Not known.', w, P.text2, '  '), [])

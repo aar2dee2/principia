@@ -243,3 +243,28 @@ export const LIFETIME = {
 // The shell that finds the Claude Code process this hook runs in: walks up from the shell's
 // parent to the first claude (or node/bun, on other installs) process.
 export const FIND_SELF = 'p=$PPID; while [ "$p" -gt 1 ]; do c=$(ps -o comm= -p "$p" 2>/dev/null | tr -d " "); case "$c" in *claude*|node|bun|*node*) echo "$p"; exit 0;; esac; p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d " "); [ -z "$p" ] && exit 1; done; exit 1'
+
+// ---------- files created in the session's folder since it began ----------
+
+// Folders never scanned for created files: dependencies, build output, caches, VCS.
+export const PRUNE = ['.git', 'node_modules', '.venv', 'venv', 'dist', 'build', 'target', '__pycache__', '.next', '.nuxt', '.turbo', '.gstack', '.cache', '.context', 'DerivedData', 'Pods', '.pytest_cache', '.mypy_cache']
+
+// `touch -t` stamp (local time) for a reference file whose mtime marks the session's start.
+export function touchStamp(ms: number): string {
+  const d = new Date(ms)
+  const p = (n: number, w = 2) => String(n).padStart(w, '0')
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}.${p(d.getSeconds())}`
+}
+
+// find(1) for files born (macOS) or modified (elsewhere) after the reference file, skipping
+// the pruned folders. Birth time is what tells a created file from an edited one; where only
+// mtime exists, edited files appear too and are told apart by the ledger's own edit events.
+export function findCreatedArgs(root: string, ref: string, os: 'mac' | 'linux' | 'windows'): string[] {
+  const names = PRUNE.flatMap((n, i) => [...(i ? ['-o'] : []), '-name', n])
+  return ['find', root, '(', ...names, ')', '-prune', '-o', '-type', 'f', os === 'mac' ? '-newerBm' : '-newer', ref, '-print']
+}
+
+// `stat` output lines "<mtime seconds> <path>" → path and time in ms.
+export function statLines(out: string): { path: string; at: number }[] {
+  return out.split('\n').map(l => /^\s*(\d+)\s+(.+?)\s*$/.exec(l)).filter((m): m is RegExpExecArray => !!m).map(m => ({ at: Number(m[1]) * 1000, path: m[2] as string }))
+}

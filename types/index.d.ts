@@ -40,23 +40,11 @@ export type Requirement = {
   manual?: string
   // When the agent was told to continue with this ask it had not started (status 'captured').
   pokedAt?: number
-  // A one-off action in this session (commit, push, run a command), not a lasting property.
-  step?: boolean
-  // A standing constraint on how the agent works here ("no DB writes"): held, not built; a breach is a conflict.
-  rule?: boolean
-  // Whether the first version can ship without it ('later') or not ('first').
-  ship?: 'first' | 'later'
-  // Research and writing: the sources the agent attached, and the audit by another model.
-  sources?: string[]
-  audit?: { at: number; model: string; cleared: boolean; note: string }
-  // Something people should hear about: the outreach for it (a post, a reel, a demo) and where it is.
-  tell?: { status: 'todo' | 'drafted' | 'published'; path?: string; at: number }
 }
 
 // Things worth acting on that are easy to miss in the chat: a tool call that failed or was
 // refused, something the agent found that was new or unexpected, or a conflicting instruction.
-// 'decision', 'blocker' and 'manual' are what the agent said only you can do.
-export type SignalKind = 'failed' | 'blocked' | 'finding' | 'conflict' | 'decision' | 'blocker' | 'manual'
+export type SignalKind = 'failed' | 'blocked' | 'finding' | 'conflict'
 export type Signal = {
   id: string
   kind: SignalKind
@@ -65,8 +53,6 @@ export type Signal = {
   eventId?: string
   reqId?: string
   dismissed?: boolean
-  // Set when a later turn dealt with it (its requirement moved on, or the finding went stale).
-  resolvedAt?: number
   // What was going on when it happened: your message that started the turn, what the agent
   // ran or touched, and the first of what came back.
   context?: { ask?: string; did?: string; output?: string }
@@ -79,24 +65,6 @@ export type PlanStep = {
 }
 
 export type Preview = { url: string; at: number; eventId: string }
-
-// Principia's own model use: calls to Haiku (and the audit model), tokens estimated from text
-// when the result does not report them.
-export type Usage = { calls: number; tokensIn: number; tokensOut: number; estimated: boolean; byPurpose: Record<string, number>; since: number }
-
-// A file the session created (written, or downloaded), with what it is for.
-export type SessionFile = {
-  path: string
-  at: number
-  kind: 'written' | 'downloaded' | 'found'
-  kb?: number
-  eventId?: string
-  // The command or tool call that produced it, when known.
-  madeBy?: string
-  why?: string
-  contains?: string
-  use?: string
-}
 
 // What the session costs this computer (the same shape as hooks/footprint.ts): memory its
 // processes hold now, and the files it leaves, in KB.
@@ -208,8 +176,6 @@ declare module 'claude-code' {
       turns: { at: number; ask: string; answer: string }[]
       previews: Preview[]
       footprint?: Footprint
-      usage?: Usage
-      files?: SessionFile[]
     }
   }
 }

@@ -13,19 +13,17 @@ import type {
   ReqFilter,
   ReqStatus,
   Requirement,
-  SessionFile,
   Signal,
   SignalKind,
   Theme,
-  Usage,
   View,
 } from '../types'
-import { AUDIT_SYSTEM, CMO_SYSTEM, FILES_SYSTEM, IDEAS_SYSTEM, REVIEW_SYSTEM, TAG_SYSTEM, auditPrompt, buildLedger, filesPrompt, ideasPrompt, judgeStatuses, parseAudit, parseCmo, parseFiles, parseIdeas, parseReview, parseTagged, reviewPrompt, tagPrompt, turnsAsConversation } from './tagging'
+import { REVIEW_SYSTEM, TAG_SYSTEM, buildLedger, judgeStatuses, parseReview, parseTagged, reviewPrompt, tagPrompt, turnsAsConversation } from './tagging'
 import type { Complete, LedgerItem, PastPrompt, Progress, Tagged, Turn } from './tagging'
-import { PLAN_TOOLS, REQ_FILTERS, failureText, filterReqs, findCheck, gapOf, guardOf, humanText, isRule, isSecretPath, isStep, lastShip, linker, planFrom, previewUrls, sessionKind, shipGate, trimEvents } from './work'
+import { PLAN_TOOLS, REQ_FILTERS, failureText, filterReqs, findCheck, gapOf, humanText, isSecretPath, linker, planFrom, previewUrls, trimEvents } from './work'
 import type { ReqFilterName } from './work'
 import { RELEASE } from './release'
-import { FIND_SELF, SHARED_NAMES, appDirs, appRss, cacheDirs, changedPaths, duKb, duLines, fetchedPaths, findCreatedArgs, fmtKb, ignoredPaths, roleOf, statLines, sumKb, touchStamp, treeRss, workspaceOf, writtenPaths } from './footprint'
+import { FIND_SELF, SHARED_NAMES, appDirs, appRss, cacheDirs, changedPaths, duKb, duLines, fetchedPaths, fmtKb, ignoredPaths, roleOf, sumKb, treeRss, workspaceOf, writtenPaths } from './footprint'
 import type { Sized } from './footprint'
 import type { Footprint } from './footprint'
 import { EDITORS, LINUX, MAC, WINDOWS, base, firstLine, join, launchCommand, programName } from './platform'
@@ -70,8 +68,6 @@ const drawnA = atom({ plugin: 'principia', key: 'drawn' } as const, false)
 const turnsA = atom({ plugin: 'principia', key: 'turns' } as const, [] as Turn[])
 // What this session costs the computer: memory held now, files left behind (see footprint.ts).
 const footprintA = atom({ plugin: 'principia', key: 'footprint' } as const, undefined as Footprint | undefined)
-const usageA = atom({ plugin: 'principia', key: 'usage' } as const, undefined as Usage | undefined)
-const filesA = atom({ plugin: 'principia', key: 'files' } as const, [] as SessionFile[])
 const CONSOLIDATE_EVERY = 6
 
 const STATUS: Record<ReqStatus, { label: string; tone: Tone }> = {
@@ -145,9 +141,6 @@ async function mirror($: $T) {
     ])
     const turns = await read($, turnsA)
     const footprint = await read($, footprintA)
-    const usage = await read($, usageA)
-    const files = await read($, filesA)
-    const allTime = (await $.store.get('usage').catch(() => undefined)) as Usage | undefined
     // Work that finishes after the session has gone (a review still running when you quit) sees
     // empty state; writing that would wipe the ledger, so an empty ledger never replaces a full one.
     if (!reqs.length && !events.length) {
@@ -156,7 +149,6 @@ async function mirror($: $T) {
     }
     await $.fs.write(stateFile(), JSON.stringify({
       sessionId, project, cwd: sessionRoot, footprint, title, hasEnded, entry, drawn, turns: turns.slice(-400),
-      guard: guardOf(events, sessionRoot), kind: sessionKind(events), ship: lastShip(events), usage, allTimeUsage: allTime, files,
       reqs, replies, events: trimEvents(events), signals: signals.slice(-100), plan, previews,
       isWorking: Boolean(turnId) && !hasEnded, editors: plat.editors, snapDir: join(plat.data, 'snapshots'), theme, dark: view.dark, at: now(),
       transcriptsAllowed: await transcriptsAllowed($),
@@ -199,60 +191,10 @@ async function addSignal($: $T, kind: SignalKind, text: string, link: Pick<Signa
   await mirror($)
 }
 
-// ---------- Principia's own model use ----------
-
-// Every model call Principia makes is counted, per session and for all sessions together (in
-// the plugin's shared store), so its own cost is in the open. Token counts come from the
-// result when it reports them, else from the text (about four characters a token).
-type CompleteResult = { isAnswered: boolean; text?: string; usage?: Record<string, number> }
-async function tally($: $T, purpose: string, sent: string, res: CompleteResult) {
-  const u = res.usage ?? {}
-  const reported = u.inputTokens ?? u.input_tokens
-  const tokensIn = reported ?? Math.ceil(sent.length / 4)
-  const tokensOut = u.outputTokens ?? u.output_tokens ?? Math.ceil((res.text ?? '').length / 4)
-  const add = (x: Usage | undefined): Usage => ({
-    calls: (x?.calls ?? 0) + 1, tokensIn: (x?.tokensIn ?? 0) + tokensIn, tokensOut: (x?.tokensOut ?? 0) + tokensOut,
-    estimated: (x?.estimated ?? false) || reported === undefined, since: x?.since ?? now(),
-    byPurpose: { ...(x?.byPurpose ?? {}), [purpose]: ((x?.byPurpose ?? {})[purpose] ?? 0) + 1 },
-  })
-  await update($, usageA, add)
-  try {
-    const all = (await $.store.get('usage')) as Usage | undefined
-    await $.store.set('usage', add(all))
-  } catch {
-    // the shared total is best effort
-  }
-}
-
 // What the agent did in a turn, as short lines for the review.
 const workOf = (events: ActivityEvent[], since: number) => events
   .filter(ev => ev.at >= since && (ev.kind === 'code' || ev.kind === 'test' || ev.kind === 'command'))
   .map(ev => `${KIND[ev.kind].label}: ${ev.title}${ev.state === 'failed' ? ' (failed)' : ev.kind === 'test' && ev.state === 'ok' ? ' (passed)' : ''}`)
-
-// Two sentences about the same thing: most of their words in common.
-function similar(a: string, b: string): boolean {
-  const words = (t: string) => new Set(t.toLowerCase().split(/\W+/).filter(w => w.length > 3))
-  const A = words(a), B = words(b)
-  if (!A.size || !B.size) return false
-  const common = [...A].filter(w => B.has(w)).length
-  return common / Math.min(A.size, B.size) >= 0.6
-}
-
-// A signal is over when its requirement moved on (verified, done for now, deferred), or, for a
-// finding with no requirement, after three further turns: nobody acts on week-old commentary.
-async function resolveSignals($: $T, movedIds: string[]) {
-  const reqs = await read($, reqsA)
-  const turns = (await read($, turnsA)).length
-  const settled = new Set(reqs.filter(r => r.status === 'verified' || r.status === 'revisit' || r.status === 'deferred').map(r => r.id))
-  const turnAt = (await read($, turnsA)).slice(-3)[0]?.at ?? 0
-  await update($, signalsA, list => list.map(s => {
-    if (s.dismissed || s.resolvedAt) return s
-    if (s.reqId && settled.has(s.reqId)) return { ...s, resolvedAt: now() }
-    if (s.reqId && s.kind === 'conflict' && movedIds.includes(s.reqId) && reqs.find(r => r.id === s.reqId)?.conflict === undefined) return { ...s, resolvedAt: now() }
-    if (s.kind === 'finding' && !s.reqId && turns >= 3 && s.at < turnAt) return { ...s, resolvedAt: now() }
-    return s
-  }))
-}
 
 async function consolidate($: $T) {
   try {
@@ -291,24 +233,14 @@ async function applyProgress($: $T, progress: Progress[], from: string): Promise
 async function review($: $T, answer: string, eventId: string, work: string[], ask: string): Promise<string[]> {
   try {
     const reqs = (await read($, reqsA)).filter(r => r.status !== 'deferred')
-    const prompt = reviewPrompt(reqs, answer, work, ask)
-    const res = await $.model.complete({ model: HAIKU, system: REVIEW_SYSTEM, prompt, maxTokens: 2000 })
-    await tally($, 'review', REVIEW_SYSTEM + prompt, res)
+    const res = await $.model.complete({ model: HAIKU, system: REVIEW_SYSTEM, prompt: reviewPrompt(reqs, answer, work, ask), maxTokens: 2000 })
     if (!res.isAnswered) return []
-    const { findings, conflicts: against, progress, onYou, tellable } = parseReview(res.text)
+    const { findings, conflicts: against, progress } = parseReview(res.text)
     await applyProgress($, progress, "Judged from the agent's report")
-    // Something people would notice shipped: its outreach is part of the build, not an afterthought.
-    if (tellable.length) await update($, reqsA, list => list.map(r => (tellable.includes(r.id) && !r.tell && !isStep(r) ? { ...r, tell: { status: 'todo' as const, at: now() } } : r)))
-    await resolveSignals($, progress.map(p => p.id))
     const context = { ask: clip(ask, 600), did: work.slice(-8).join('\n'), output: clip(answer, 800) }
-    const open = (await read($, signalsA)).filter(s => !s.dismissed && !s.resolvedAt)
-    const seen = (kind: SignalKind, reqId?: string, text?: string) =>
-      open.some(s => s.kind === kind && ((reqId && s.reqId === reqId) || (text && similar(s.text, text))))
-    for (const f of findings) if (!seen('finding', undefined, f.text)) await addSignal($, 'finding', f.text, { eventId, context })
-    // What only the person can do is the inbox: each item once, however many turns repeat it.
-    for (const o of onYou) if (!seen(o.kind, o.id, o.text)) await addSignal($, o.kind, o.text, { eventId, reqId: o.id, context })
+    for (const f of findings) await addSignal($, 'finding', f.text, { eventId, context })
     for (const c of against) {
-      if (!reqs.some(r => r.id === c.id) || seen('conflict', c.id)) continue
+      if (!reqs.some(r => r.id === c.id)) continue
       await update($, reqsA, (list): Requirement[] => list.map(r => (r.id === c.id ? { ...r, conflict: { reason: c.reason, at: now(), source: 'agent' } } : r)))
       await addSignal($, 'conflict', `The agent's work goes against ${c.id}: ${c.reason}`, { eventId, reqId: c.id, context })
     }
@@ -333,9 +265,7 @@ async function linkTurn($: $T, since: number, until: number, ids: string[]) {
 
 async function tag($: $T, text: string, reqs: Requirement[]): Promise<Tagged[]> {
   const lastReply = [...(await read($, eventsA))].reverse().find(ev => ev.kind === 'message')?.detail ?? ''
-  const prompt = tagPrompt(reqs, text, lastReply)
-  const res = await $.model.complete({ model: HAIKU, system: TAG_SYSTEM, prompt, maxTokens: 2000 })
-  await tally($, 'tagging', TAG_SYSTEM + prompt, res)
+  const res = await $.model.complete({ model: HAIKU, system: TAG_SYSTEM, prompt: tagPrompt(reqs, text, lastReply), maxTokens: 2000 })
   return res.isAnswered ? parseTagged(res.text) : []
 }
 
@@ -374,10 +304,8 @@ async function capture($: $T, text: string): Promise<string[]> {
         touched.push(`${target.id} (refined): ${t.title}`)
       } else {
         const id = nextId(out)
-        const step = t.kind === 'step', rule = t.kind === 'rule'
-        // A rule is in force from the moment it is said: nothing to start, nothing to verify.
-        out = [...out, { id, title: t.title, status: rule ? 'verified' : 'captured', at: now(), history: [version], evidence: rule ? [{ kind: 'note', at: now(), text: 'A standing rule for this session: held unless a conflict is raised.' }] : [], ...(step ? { step: true } : {}), ...(rule ? { rule: true } : {}) }]
-        touched.push(`${id}${step ? ' (step)' : rule ? ' (rule)' : ''}: ${t.title}`)
+        out = [...out, { id, title: t.title, status: 'captured', at: now(), history: [version], evidence: [] }]
+        touched.push(`${id}: ${t.title}`)
       }
     }
     return out
@@ -440,79 +368,9 @@ async function snapshot($: $T, ev: ActivityEvent) {
     const exists = await $.fs.exists(ev.file)
     const text = exists ? String(await $.fs.read(ev.file)) : ''
     await $.fs.write(snapOf(ev), text)
-    // A file that did not exist before this call is one the session created.
-    if (!exists) await update($, filesA, list => (list.some(f => f.path === ev.file) ? list : [...list, { path: ev.file as string, at: ev.at, kind: 'written' as const, eventId: ev.id }].slice(-300)))
   } catch {
     // no snapshot: the diff button falls back to opening the file
   }
-}
-
-// ---------- the files a session created, and what each is for ----------
-
-// Files born in the session's folder after the session began (birth time on macOS, mtime
-// elsewhere), plus files git does not track there. Dependency, build and cache folders are
-// skipped, and so are files that may hold secrets. The ledger's own edit events say which of
-// the mtime matches were edits of existing files rather than new ones.
-async function createdSince($: $T, root: string, since: number): Promise<{ path: string; at: number }[]> {
-  if (plat.os === 'windows') return []
-  const ref = join(plat.data, `since-${sessionId}`)
-  await $.fs.write(ref, '').catch(() => undefined)
-  await run($, ['touch', '-t', touchStamp(since), ref])
-  const byFind = ((await run($, findCreatedArgs(root, ref, plat.os), 60_000))?.stdout ?? '').split('\n').map(l => l.trim()).filter(Boolean)
-  const untracked = ((await run($, ['git', '-C', root, 'ls-files', '--others', '--exclude-standard']))?.stdout ?? '').split('\n').map(l => l.trim()).filter(Boolean).map(l => join(root, l))
-  const events = await read($, eventsA)
-  const editedExisting = new Set(events.filter(e => e.kind === 'code' && e.file).map(e => e.file as string))
-  const created = (await read($, filesA)).map(f => f.path)
-  const paths = [...new Set([...byFind, ...untracked])]
-    .filter(p => !isSecretPath(p) && !/\/\.DS_Store$|\/since-|state-.*\.json$/.test(p))
-    .filter(p => plat.os === 'mac' || !editedExisting.has(p) || created.includes(p))
-    .slice(0, 300)
-  if (!paths.length) return []
-  const stat = (await run($, ['sh', '-c', plat.os === 'mac' ? 'stat -f "%m %N" "$@" 2>/dev/null' : 'stat -c "%Y %n" "$@" 2>/dev/null', 'sh', ...paths], 30_000))?.stdout ?? ''
-  const times = new Map(statLines(stat).map(x => [x.path, x.at]))
-  return paths.map(p => ({ path: p, at: times.get(p) ?? now() }))
-}
-
-// Once every files pass, the files created since the last description are read (their first
-// lines) and described in one Haiku call: why each was made, what it holds, what it is for now.
-async function describeFiles($: $T) {
-  const files = await read($, filesA)
-  const todo = files.filter(f => f.why === undefined).slice(0, 8)
-  if (!todo.length) return
-  const turns = await read($, turnsA)
-  const askAt = (at: number) => [...turns].reverse().find(t => t.at <= at)?.ask ?? ''
-  const events = await read($, eventsA)
-  // What produced the file: the tool call that wrote it, else the last command naming it.
-  const madeBy = (f: SessionFile) => {
-    if (f.madeBy) return f.madeBy
-    if (f.kind === 'downloaded') return 'a download by a shell command'
-    const ev = f.eventId ? events.find(e => e.id === f.eventId) : undefined
-    if (ev) return `${ev.title} (${ev.kind === 'code' ? 'the agent wrote it with its editor tool' : 'a command'})`
-    const name = base(f.path)
-    const cmd = [...events].reverse().find(e => (e.kind === 'command' || e.kind === 'test') && e.at <= f.at + 60_000 && (e.detail ?? '').includes(name))
-    return cmd ? `command: ${clip(cmd.detail ?? cmd.title, 500)}` : ''
-  }
-  const heads: { path: string; head: string; ask: string; madeBy?: string }[] = []
-  for (const f of todo) {
-    let head = ''
-    try {
-      const text = isSecretPath(f.path) ? '' : String(await $.fs.read(f.path))
-      head = /[\x00-\x08]/.test(text.slice(0, 2000)) ? '(binary)' : text.split('\n').slice(0, 40).join('\n')
-    } catch {
-      head = '(could not be read; it may have been deleted)'
-    }
-    heads.push({ path: f.path, head, ask: askAt(f.at), madeBy: madeBy(f) })
-  }
-  const prompt = filesPrompt(heads)
-  const res = await $.model.complete({ model: HAIKU, system: FILES_SYSTEM, prompt, maxTokens: 1500 })
-  await tally($, 'files', FILES_SYSTEM + prompt, res)
-  const notes = res.isAnswered ? parseFiles(res.text) : []
-  await update($, filesA, list => list.map(f => {
-    const n = notes.find(x => x.path === f.path || base(x.path) === base(f.path))
-    if (!todo.some(t => t.path === f.path)) return f
-    // Described, or marked as tried, so one unreadable file is not retried every pass.
-    return n ? { ...f, why: n.why, contains: n.contains, use: n.use } : { ...f, why: '', contains: '', use: 'unknown' }
-  }))
 }
 
 async function openDiff($: $T, ev: ActivityEvent, how: string) {
@@ -763,14 +621,14 @@ const NUDGE_AFTER = 20_000
 async function nudgeVerify($: $T): Promise<number> {
   if (hasEnded || (await $.store.get('nudge').catch(() => undefined)) === 'off') return 0
   if (await read($, turnA)) return 0 // a new turn has started; its own review nudges later
-  const due = (await read($, reqsA)).filter(r => r.status === 'implemented' && !r.needsReverify && !r.nudgedAt && !r.manual && !isRule(r) && !isStep(r))
+  const due = (await read($, reqsA)).filter(r => r.status === 'implemented' && !r.needsReverify && !r.nudgedAt && !r.manual)
   if (!due.length) return 0
   await update($, reqsA, list => list.map(r => (due.some(d => d.id === r.id) ? { ...r, nudgedAt: now() } : r)))
   await deliver(
     $,
     `[Ledger] Done but not verified: ${due.map(r => `${r.id} ${r.title}`).join('; ')}. ` +
       `For each, run the command that proves it (a test, build, ffprobe, grep, curl, your own script: any Bash call that exits 0) and report with the ${TOOL} tool (status verified, test_command = a distinctive part of that command). ` +
-      'If one can only be checked by hand (research, writing, a video to watch), update it with manual_check saying what to check; it will not be asked about again. Answer in one line per item, no tables.',
+      'If one can only be checked by hand (research, writing, a video to watch), update it with manual_check saying what to check; it will not be asked about again.',
     { interrupt: false, start: true },
   )
   await save($)
@@ -783,61 +641,16 @@ async function nudgeVerify($: $T): Promise<number> {
 async function nudgeOpen($: $T): Promise<number> {
   if (hasEnded || (await $.store.get('nudge').catch(() => undefined)) === 'off') return 0
   if (await read($, turnA)) return 0
-  const due = (await read($, reqsA)).filter(r => r.status === 'captured' && !r.pokedAt && r.history[0]?.by !== 'agent' && r.at < turnStartedAt && !isRule(r))
+  const due = (await read($, reqsA)).filter(r => r.status === 'captured' && !r.pokedAt && r.history[0]?.by !== 'agent' && r.at < turnStartedAt)
   if (!due.length) return 0
   await update($, reqsA, list => list.map(r => (due.some(d => d.id === r.id) ? { ...r, pokedAt: now() } : r)))
   await deliver(
     $,
     `[Ledger] Asked but not started: ${due.map(r => `${r.id} ${r.title}`).join('; ')}. ` +
-      `Continue with them now. If one cannot be done yet, set its status with the ${TOOL} tool (blocked, needs_clarification or revisit) and say why, in one line each.`,
+      `Continue with them now. If one cannot be done yet, set its status with the ${TOOL} tool (blocked, needs_clarification or revisit) and say why.`,
     { interrupt: false, start: true },
   )
   await save($)
-  return due.length
-}
-
-// Edits without a test run are how regressions ship. When the session goes idle after a turn
-// that edited files and no test has passed since, the agent is told once per batch of edits to
-// run the project's tests (the last command that passed, when there is one).
-let testNudgedAt = 0
-async function nudgeTests($: $T): Promise<number> {
-  if (hasEnded || (await $.store.get('nudge').catch(() => undefined)) === 'off') return 0
-  if (await read($, turnA)) return 0
-  const events = await read($, eventsA)
-  const guard = guardOf(events, sessionRoot)
-  const lastEdit = Math.max(0, ...events.filter(e => e.kind === 'code' && (!sessionRoot || (e.file ?? '').startsWith(sessionRoot))).map(e => e.at))
-  if (!guard || !guard.editsSince || lastEdit <= testNudgedAt) return 0
-  testNudgedAt = now()
-  await deliver(
-    $,
-    `[Ledger] ${guard.editsSince} edit${guard.editsSince === 1 ? '' : 's'} since the last passing test run${guard.command ? ` (${guard.command}, ${hhmm(guard.passedAt ?? 0)})` : ' (none in this session yet)'}: ${guard.edited.join(', ')}. ` +
-      `Run the project's tests (or the check that covers these files) before moving on, and report with the ${TOOL} tool. If they fail, say so and fix them first. Answer in one line per item, no tables.`,
-    { interrupt: false, start: true },
-  )
-  return 1
-}
-
-// Building is half the work; people have to hear about it. When a session goes idle with a
-// feature finished that a customer would notice and nothing written about it, the agent is
-// asked once to make the outreach now, alongside the code: a post, a reel script, a changelog
-// line, and the screenshots or recording to show it. From the person's own CMO review skill:
-// make not marketing harder than marketing.
-async function nudgeTell($: $T): Promise<number> {
-  if (hasEnded || (await $.store.get('nudge').catch(() => undefined)) === 'off') return 0
-  if (await read($, turnA)) return 0
-  const due = (await read($, reqsA)).filter(r => r.tell?.status === 'todo' && !r.tell.path && (r.status === 'implemented' || r.status === 'verified'))
-  if (!due.length) return 0
-  await update($, reqsA, list => list.map(r => (due.some(d => d.id === r.id) ? { ...r, tell: { ...(r.tell as NonNullable<Requirement['tell']>), path: '(asked)' } } : r)))
-  const folder = sessionRoot ? join(sessionRoot, 'marketing') : 'the notes folder'
-  await deliver(
-    $,
-    `[Ledger] Shipped and worth telling people about: ${due.map(r => `${r.id} ${r.title}`).join('; ')}. ` +
-      `Write the outreach now, as part of the build, one folder per item in ${folder}/<slug>/: (1) post.md, a 120-word post in Soumya's own voice for LinkedIn and X, leading with what the reader can now do; ` +
-      '(2) reel.md, a 30-second reel script: hook line, three beats, close; (3) one changelog line; (4) the pictures: decide which screenshots or a short screen recording show it best (the feature in use, before and after, at desktop and phone widths), ' +
-      'take them yourself with the browser or preview tools you have, save them in the folder, and list what each shows; (5) who exactly should see it first. ' +
-      `No hype words. Then report with the ${TOOL} tool (tell "drafted", tell_path the folder). If an item is not worth telling anyone about, say so with tell "published" and a note.`,
-    { interrupt: false, start: true },
-  )
   return due.length
 }
 
@@ -854,7 +667,6 @@ type InboxCommand =
   | { seq: number; type: 'detach'; reqId: string; index: number }
   | { seq: number; type: 'dismiss'; signalId: string }
   | { seq: number; type: 'gaps' }
-  | { seq: number; type: 'build'; url: string; title: string; why?: string }
 
 // A conflict is settled by the person, not the agent: this clears the flag and its signals.
 async function resolveConflict($: $T, id: string) {
@@ -911,8 +723,6 @@ async function pollInbox($: $T) {
       await save($)
     } else if (c.type === 'gaps') {
       await askGaps($)
-    } else if (c.type === 'build') {
-      await buildIdea($, c)
     }
   }
 }
@@ -1099,19 +909,6 @@ async function measureFootprint($: $T, files: boolean) {
     const shared = (await sizes(sharedPaths)).map(x => ({ ...x, role: roleOf(x.path) }))
     const caches = await sizes(cacheDirs(home, plat.os, [plat.tmp]))
     const app = await sizes(appDirs(home, plat.os))
-    // Downloads join the session's files, and so does whatever appeared in the session's folder
-    // since it began (a CSV a script wrote, a database a query made): found by birth time, and,
-    // in a git repository, by being untracked. Every created file gets its size.
-    const found = sessionRoot ? await createdSince($, sessionRoot, Math.min(now(), ...events.map(e => e.at))) : []
-    await update($, filesA, list => {
-      const out = [...list]
-      for (const f of fetched) if (!out.some(x => x.path === f.path)) out.push({ path: f.path, at: now(), kind: 'downloaded' })
-      for (const f of found) if (!out.some(x => x.path === f.path)) out.push({ path: f.path, at: f.at, kind: 'found' })
-      return out.slice(-400)
-    })
-    const fileSizes = await sizes((await read($, filesA)).map(f => f.path))
-    await update($, filesA, list => list.map(f => ({ ...f, kb: fileSizes.find(x => x.path === f.path)?.kb ?? f.kb })))
-    $.clock.after(0, () => void describeFiles($).catch(() => undefined))
     disk = {
       transcriptKb: transcript ? await size(transcript) : 0,
       ledgerKb: await size(stateFile()),
@@ -1383,9 +1180,6 @@ const TOOL_DESCRIPTION =
   'Any command counts (tests, builds, ffprobe, grep, curl, your own scripts), on its own or inside a compound command or pipe; ' +
   'files changed by shell commands are not edits. When nothing can be run (research, writing, a video to watch), ' +
   'set manual_check to what a person should check: the requirement stays "done, not verified" and is not asked about again. ' +
-  'In a research or writing session "verified" instead needs sources (the links or documents behind the answer) and an audit by another model that cleared it (/ledger audit); pass sources when you report. ' +
-  'ship: "first" when the first version cannot ship without it, "later" when it can wait. ' +
-  'tell: outreach is part of the build; when a feature people would notice is done, write its post, reel script and changelog line, take its screenshots, and report tell "drafted" with tell_path. ' +
   'Start plan and todo items with the ids they serve, e.g. "[R2] Add search".'
 
 const TOOL_SCHEMA = {
@@ -1396,10 +1190,6 @@ const TOOL_SCHEMA = {
     status: { type: 'string', enum: ['in_progress', 'implemented', 'verified', 'blocked', 'needs_clarification', 'revisit'] },
     test_command: { type: 'string', description: 'verified: part of a Bash command that exited 0 after your last edit' },
     manual_check: { type: 'string', description: 'what a person should check when nothing can be run; stops the verify nudge for this requirement' },
-    sources: { type: 'string', description: 'research/writing: the sources behind the answer, one per line (URLs, file paths, document names)' },
-    tell: { type: 'string', enum: ['todo', 'drafted', 'published'], description: 'outreach for this: todo (worth telling people), drafted (written, give tell_path), published' },
-    tell_path: { type: 'string', description: 'where the outreach draft is' },
-    ship: { type: 'string', enum: ['first', 'later'], description: 'whether the first version can ship without this' },
     note: { type: 'string' },
     title: { type: 'string', description: 'add: the new requirement' },
     derived_from: { type: 'string', description: 'add: id it splits' },
@@ -1433,21 +1223,7 @@ async function ledgerTool($: $T, a: Record<string, unknown>): Promise<string> {
   let reply = `${req.id} → ${STATUS[status].label}.`
   const evidence = [...req.evidence]
   let manual = status === 'implemented' ? req.manual : undefined
-  const sources = [...(req.sources ?? []), ...s('sources').split(/\n|,\s+/).map(x => x.trim()).filter(x => x.length > 3)].filter((x, i, a) => a.indexOf(x) === i)
-  const kind = sessionKind(await read($, eventsA))
-  if (status === 'verified' && kind !== 'code' && !req.step) {
-    // Research and writing: nothing runs. Verified needs the sources behind the answer and an
-    // audit by another model that found no gap in it.
-    if (!sources.length) {
-      status = 'implemented'
-      reply = `${req.id} recorded as done but NOT verified: this is a ${kind} session, so verified needs sources (pass them in sources) and an audit by another model (/ledger audit) that clears it.`
-    } else if (!req.audit?.cleared) {
-      status = 'implemented'
-      reply = `${req.id} recorded as done but NOT verified: ${req.audit ? `the last audit (${hhmm(req.audit.at)}) found: ${req.audit.note}` : 'no audit by another model has cleared it yet'}. Sources are recorded; ask the user to run /ledger audit, or fix the gap and ask again.`
-    } else {
-      evidence.push({ kind: 'test', at: now(), text: `Audited by ${req.audit.model}: ${req.audit.note}` })
-    }
-  } else if (status === 'verified') {
+  if (status === 'verified') {
     // Evidence is a command the agent names that ran and passed after the last edit; the
     // refusal says which of those failed, so the agent doesn't just run it again blindly.
     const found = findCheck(await read($, eventsA), s('test_command'))
@@ -1473,9 +1249,6 @@ async function ledgerTool($: $T, a: Record<string, unknown>): Promise<string> {
       const base = renudge(r, status)
       return {
         ...base, status, evidence, manual,
-        sources: sources.length ? sources : r.sources,
-        ship: s('ship') === 'first' || s('ship') === 'later' ? (s('ship') as 'first' | 'later') : r.ship,
-        tell: ['todo', 'drafted', 'published'].includes(s('tell')) ? { status: s('tell') as 'todo' | 'drafted' | 'published', path: s('tell_path') || r.tell?.path, at: now() } : r.tell,
         // A check by hand counts as this session's one nudge: it is not asked about again.
         nudgedAt: manual ? base.nudgedAt ?? now() : base.nudgedAt,
         needsReverify: status === 'verified' ? false : r.needsReverify,
@@ -1485,268 +1258,6 @@ async function ledgerTool($: $T, a: Record<string, unknown>): Promise<string> {
   )
   await save($)
   return reply
-}
-
-// ---------- research and writing: an audit by another model ----------
-
-const AUDIT_MODEL = 'claude-sonnet-5-5'
-
-// Each requirement that is done but not verified is judged, with its sources and the agent's
-// answers for it, by a different model than the one that wrote them. Cleared items with
-// sources become verified; the others keep the auditor's note.
-async function auditCommand($: $T, arg: string): Promise<string> {
-  const reqs = await read($, reqsA)
-  const wanted = arg.split(/\s+/).filter(x => /^R\d+$/i.test(x)).map(x => x.toUpperCase())
-  const due = reqs.filter(r => (wanted.length ? wanted.includes(r.id) : r.status === 'implemented') && !r.step)
-  if (!due.length) return wanted.length ? `None of ${wanted.join(', ')} is in this ledger.` : 'Nothing to audit: no requirement is done but not verified.'
-  const turns = await read($, turnsA)
-  const link = linker(reqs, turns.map(t => t.at))
-  const answerFor = (r: Requirement) => {
-    const own = turns.filter(t => link({ id: '', kind: 'message', at: t.at + 1, title: '' }).includes(r.id)).map(t => t.answer)
-    return (own.length ? own : turns.slice(-2).map(t => t.answer)).join('\n\n---\n\n').slice(-8000)
-  }
-  const items = due.map(r => ({ id: r.id, title: r.title, sources: r.sources ?? [], answer: answerFor(r) }))
-  const prompt = auditPrompt(items)
-  const res = await $.model.complete({ model: AUDIT_MODEL, system: AUDIT_SYSTEM, prompt, maxTokens: 3000 })
-  await tally($, 'audit', AUDIT_SYSTEM + prompt, res)
-  if (!res.isAnswered) return `The audit model did not answer (${res.reason ?? 'no reason given'}). Nothing was changed.`
-  const verdicts = parseAudit(res.text)
-  if (!verdicts.length) return 'The audit model answered, but not in a form Principia could read. Nothing was changed.'
-  let cleared = 0
-  await update($, reqsA, list => list.map(r => {
-    const v = verdicts.find(x => x.id === r.id)
-    if (!v) return r
-    const audit = { at: now(), model: AUDIT_MODEL, cleared: v.cleared, note: v.note }
-    const canVerify = v.cleared && (r.sources?.length ?? 0) > 0
-    if (canVerify) cleared++
-    return {
-      ...r, audit,
-      status: canVerify ? 'verified' : r.status,
-      evidence: [...r.evidence, { kind: canVerify ? 'test' as const : 'note' as const, at: now(), text: `${v.cleared ? 'Audit cleared' : 'Audit found a gap'} (${AUDIT_MODEL}): ${v.note}` }],
-    }
-  }))
-  await save($)
-  const gaps = verdicts.filter(v => !v.cleared)
-  const noSources = verdicts.filter(v => v.cleared && !(reqs.find(r => r.id === v.id)?.sources?.length))
-  return [
-    `Audited ${verdicts.length} with ${AUDIT_MODEL}: ${cleared} verified.`,
-    gaps.length ? `Gaps: ${gaps.map(g => `${g.id} (${g.note})`).join('; ')}.` : '',
-    noSources.length ? `Cleared but without sources, so not verified: ${noSources.map(v => v.id).join(', ')}. The agent attaches them with the ledger tool (sources).` : '',
-  ].filter(Boolean).join(' ')
-}
-
-// ---------- shipping ----------
-
-async function shipCommand($: $T, arg: string): Promise<string> {
-  const m = /^(R\d+)\s+(first|later)$/i.exec(arg)
-  if (!m) return 'Usage: /ledger ship R12 first (the first version needs it) or /ledger ship R12 later (it can wait).'
-  const id = (m[1] as string).toUpperCase()
-  const when = (m[2] as string).toLowerCase() as 'first' | 'later'
-  if (!(await read($, reqsA)).some(r => r.id === id)) return `No requirement ${id}.`
-  await update($, reqsA, list => list.map(r => (r.id === id ? { ...r, ship: when } : r)))
-  await save($)
-  return `${id}: ${when === 'first' ? 'needed for the first version' : 'can ship later'}.`
-}
-
-// A brief for a new session: the project's open requirements across all its sessions, what is
-// waiting on you, and what shipped last. Written next to the ledgers and returned to paste.
-async function briefCommand($: $T): Promise<string> {
-  const mine = await read($, reqsA)
-  const files = await $.fs.list(plat.data).catch(() => [] as { name: string }[])
-  type St = { sessionId: string; project?: string; cwd?: string; title?: string; at?: number; reqs?: Requirement[]; signals?: Signal[]; ship?: { at: number; command: string } }
-  const states: St[] = []
-  for (const f of files) {
-    if (!/^state-.*\.json$/.test(f.name)) continue
-    const st = await $.fs.read(join(plat.data, f.name)).then(t => JSON.parse(String(t)) as St).catch(() => undefined)
-    if (st && (st.cwd === sessionRoot || (st.project === project && project !== 'This computer'))) states.push(st)
-  }
-  const lines: string[] = [`# ${project}: where things stand`, '', `Written by Principia on ${new Date().toISOString().slice(0, 16).replace('T', ' ')} from ${states.length} session${states.length === 1 ? '' : 's'}.`, '']
-  const seen = new Map<string, { r: Requirement; from: string; at: number }>()
-  for (const st of states.sort((a, b) => (a.at ?? 0) - (b.at ?? 0))) {
-    for (const r of st.reqs ?? []) {
-      if (isStep(r)) continue
-      const key = r.title.toLowerCase().replace(/\W+/g, ' ').trim()
-      const prev = seen.get(key)
-      if (!prev || (r.at ?? 0) >= prev.at) seen.set(key, { r, from: st.title ?? st.sessionId.slice(0, 8), at: r.at })
-    }
-  }
-  const all = [...seen.values()]
-  const gate = shipGate(all.map(x => x.r), states.flatMap(st => st.signals ?? []))
-  const ship = states.map(st => st.ship).filter((x): x is { at: number; command: string } => !!x).sort((a, b) => b.at - a.at)[0]
-  lines.push(`## To ship the first version (${gate.first.length} open)`, ...gate.first.map(x => `- ${x.id} ${x.title} [${STATUS[x.status].label}]`), '')
-  if (gate.onYou.length) lines.push('## Waiting on you', ...gate.onYou.map(s => `- ${s.text}`), '')
-  if (gate.unverified.length) lines.push('## Done, not verified', ...gate.unverified.map(x => `- ${x.id} ${x.title}`), '')
-  if (gate.later.length) lines.push('## Can ship later', ...gate.later.map(x => `- ${x.id} ${x.title} [${STATUS[x.status].label}]`), '')
-  lines.push(`## Last shipped`, ship ? `- ${hhmm(ship.at)} ${ship.command}` : '- nothing recorded yet', '')
-  lines.push('## Verified', ...all.filter(x => x.r.status === 'verified').map(x => `- ${x.r.id} ${x.r.title}`))
-  const out = join(plat.data, `brief-${project.replace(/[^\w.-]+/g, '_')}.md`)
-  await $.fs.write(out, lines.join('\n'))
-  return `Brief written to ${out} (${all.length} requirements from ${states.length} sessions, ${gate.first.length} open before the first version ships, ${gate.onYou.length} waiting on you). Paste it into a new session, or start one with it. ${mine.length ? '' : 'This session has no ledger of its own yet.'}`
-}
-
-// ---------- what this person works on, for judges that need to know ----------
-
-type AnyState = { sessionId: string; project?: string; cwd?: string; title?: string; at?: number; reqs?: Requirement[]; signals?: Signal[]; ship?: { at: number; command: string }; kind?: string }
-async function allStates($: $T): Promise<AnyState[]> {
-  const files = await $.fs.list(plat.data).catch(() => [] as { name: string }[])
-  const out: AnyState[] = []
-  for (const f of files) {
-    if (!/^state-.*\.json$/.test(f.name)) continue
-    const st = await $.fs.read(join(plat.data, f.name)).then(t => JSON.parse(String(t)) as AnyState).catch(() => undefined)
-    if (st) out.push(st)
-  }
-  return out
-}
-
-// Projects, what they ask for, and the research titles: built from Principia's own ledgers.
-async function profileText($: $T): Promise<string> {
-  const states = (await allStates($)).sort((a, b) => (b.at ?? 0) - (a.at ?? 0))
-  const byProject = new Map<string, string[]>()
-  for (const st of states) {
-    const name = st.project && st.project !== 'This computer' ? st.project : `research: ${clip(st.title ?? '', 60)}`
-    const titles = (st.reqs ?? []).filter(r => !isStep(r) && r.status !== 'deferred').slice(-12).map(r => r.title)
-    byProject.set(name, [...(byProject.get(name) ?? []), ...titles].slice(0, 14))
-  }
-  return [...byProject.entries()].slice(0, 16).map(([p, t]) => `- ${p}: ${t.join('; ')}`).join('\n') || '(no projects yet)'
-}
-
-// ---------- ideas: what others publish, judged for this person ----------
-
-const ideasDir = () => join(plat.data, 'ideas')
-type Idea = { source: string; via: string; title: string; url: string; hn?: string; points?: number; comments?: number; by?: string; at?: string; summary?: string; kind?: string }
-type Pick = Idea & { score: number; buckets: string[]; project?: string; why: string; judgedAt: number; kept?: boolean; tried?: boolean; dropped?: boolean; tryUrl?: string; built?: { at: number; brief: string } }
-
-async function readJsonl<T>($: $T, file: string): Promise<T[]> {
-  const text = await $.fs.read(file).then(String).catch(() => '')
-  return text.split('\n').filter(Boolean).flatMap(l => { try { return [JSON.parse(l) as T] } catch { return [] } })
-}
-async function readPicks($: $T): Promise<Pick[]> {
-  return await $.fs.read(join(ideasDir(), 'picks.json')).then(t => JSON.parse(String(t)) as Pick[]).catch(() => [] as Pick[])
-}
-const openPage = async ($: $T, page: string) => run($, plat.os === 'mac' ? ['open', page] : plat.os === 'windows' ? ['cmd', '/c', 'start', '', page] : ['xdg-open', page])
-
-// New items since the last judgement go to Haiku in batches with the profile; 6 and above are
-// kept as picks. Runs on /ledger ideas and, by itself, once a session has been open a while
-// and the last judgement is more than six hours old.
-async function judgeIdeas($: $T): Promise<string> {
-  const items = await readJsonl<Idea>($, join(ideasDir(), 'items.jsonl'))
-  if (!items.length) return 'No items pulled yet: /ledger ideas pull.'
-  const picks = await readPicks($)
-  const judged = new Set<string>((await $.fs.read(join(ideasDir(), 'judged.txt')).then(String).catch(() => '')).split('\n').filter(Boolean))
-  const todo = items.filter(it => !judged.has(it.url)).slice(0, 120)
-  if (!todo.length) return `Nothing new to judge (${items.length} items, ${picks.filter(p => !p.dropped).length} picks).`
-  const profile = await profileText($)
-  let added = 0
-  for (let i = 0; i < todo.length; i += 25) {
-    const batch = todo.slice(i, i + 25)
-    const prompt = ideasPrompt(profile, batch)
-    const res = await $.model.complete({ model: HAIKU, system: IDEAS_SYSTEM, prompt, maxTokens: 2500 })
-    await tally($, 'ideas', IDEAS_SYSTEM + prompt, res)
-    if (!res.isAnswered) continue
-    for (const v of parseIdeas(res.text, batch)) {
-      const it = batch.find(b => b.url === v.url)
-      if (it && v.score >= 6 && v.buckets.length && !picks.some(p => p.url === v.url)) { picks.push({ ...it, score: v.score, buckets: v.buckets, project: v.project, why: v.why, judgedAt: now() }); added++ }
-    }
-    for (const b of batch) judged.add(b.url)
-  }
-  await $.fs.write(join(ideasDir(), 'judged.txt'), [...judged].join('\n'))
-  await $.fs.write(join(ideasDir(), 'picks.json'), JSON.stringify(picks, null, 1))
-  await $.store.set('ideas.judgedAt', now()).catch(() => undefined)
-  if (plat.runner.length) await run($, programArgs('ideas-gallery', ideasDir()), 120_000)
-  return `Judged ${todo.length} new items against your projects: ${added} picked (${picks.filter(p => !p.dropped).length} picks in all).`
-}
-
-async function ideasCommand($: $T, arg: string): Promise<string> {
-  const [verb = '', ...rest] = arg.split(/\s+/).filter(Boolean)
-  if (!plat.runner.length && verb !== 'open') return 'The Principia program is not installed (/ledger install); it does the pulling.'
-  if (verb === 'pull') {
-    const r = await run($, programArgs('ideas-pull', ideasDir()), 180_000)
-    await $.store.set('ideas.pulledAt', now()).catch(() => undefined)
-    return r?.exitCode === 0 ? `${firstLine(r.stdout)}. /ledger ideas judges them.` : `Pull failed: ${r?.stderr.trim() || 'no output'}`
-  }
-  if (verb === 'open') {
-    const page = join(ideasDir(), 'gallery.html')
-    if (!(await $.fs.exists(page))) return 'No gallery yet: /ledger ideas first.'
-    await openPage($, page)
-    return `Opened ${page}.`
-  }
-  if (verb === 'install') {
-    if (plat.os !== 'mac') return 'Scheduled pulls are set up with launchd on macOS only so far; elsewhere, run "principia ideas-pull" from cron.'
-    const home = (await $.env.get('HOME')) ?? ''
-    const plist = join(home, 'Library', 'LaunchAgents', 'com.principia.ideas.plist')
-    const program = plat.runner[0] as string
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n  <key>Label</key><string>com.principia.ideas</string>\n  <key>ProgramArguments</key><array><string>${program}</string><string>ideas-pull</string><string>${ideasDir()}</string></array>\n  <key>StartCalendarInterval</key><array>\n    <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>30</integer></dict>\n    <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>0</integer></dict>\n    <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>\n  </array>\n  <key>StandardOutPath</key><string>${join(ideasDir(), 'pull.log')}</string>\n  <key>StandardErrorPath</key><string>${join(ideasDir(), 'pull.log')}</string>\n</dict></plist>\n`
-    await $.fs.write(plist, xml)
-    const uid = firstLine((await run($, ['id', '-u']))?.stdout) || '501'
-    await run($, ['launchctl', 'bootout', `gui/${uid}`, plist])
-    const r = await run($, ['launchctl', 'bootstrap', `gui/${uid}`, plist])
-    return r?.exitCode === 0 ? `Scheduled: the puller runs at 07:30, 13:00 and 20:00 (${plist}). Judging happens when a session is open, or with /ledger ideas.` : `Could not schedule: ${r?.stderr.trim() || 'launchctl gave no output'}. The plist is at ${plist}.`
-  }
-  if (verb === 'build') {
-    const n = Number(rest[0])
-    const picks = (await readPicks($)).filter(p => !p.dropped).sort((a, b) => b.score - a.score)
-    const pick = picks[n - 1]
-    if (!pick) return `No pick ${rest[0] ?? ''}. Picks are numbered in the window's Ideas view (I).`
-    await buildIdea($, { url: pick.url, title: pick.title, why: pick.why })
-    return `Asked the agent to start a separate session that builds a V1 of "${pick.title}" for you to try.`
-  }
-  // Plain /ledger ideas: pull if stale, judge, build the gallery, open it.
-  const last = Number(await $.store.get('ideas.pulledAt').catch(() => 0)) || 0
-  let pulled = ''
-  if (now() - last > 6 * 3_600_000) {
-    const r = await run($, programArgs('ideas-pull', ideasDir()), 180_000)
-    pulled = r?.exitCode === 0 ? `${firstLine(r.stdout)}. ` : ''
-    await $.store.set('ideas.pulledAt', now()).catch(() => undefined)
-  }
-  const said = await judgeIdeas($)
-  const page = join(ideasDir(), 'gallery.html')
-  if (await $.fs.exists(page)) await openPage($, page)
-  return `${pulled}${said} The gallery is open in your browser; I in the window lists the picks (k keep, t tried, x drop, b build a V1).`
-}
-
-// Once a session has been open a while, new items are judged on their own, at most every six hours.
-async function autoJudgeIdeas($: $T) {
-  const last = Number(await $.store.get('ideas.judgedAt').catch(() => 0)) || 0
-  if (now() - last < 6 * 3_600_000 || !(await $.fs.exists(join(ideasDir(), 'items.jsonl')))) return
-  await judgeIdeas($).catch(() => undefined)
-}
-
-// A pick becomes a thing to try: the agent in this session is told to start a separate session
-// whose only deliverable is a working first version on the real target, for the person to use.
-async function buildIdea($: $T, c: { url: string; title: string; why?: string }) {
-  const picks = await readPicks($)
-  await $.fs.write(join(ideasDir(), 'picks.json'), JSON.stringify(picks.map(p => (p.url === c.url ? { ...p, tried: true, built: { at: now(), brief: c.title } } : p)), null, 1))
-  await deliver(
-    $,
-    `[Ledger] Soumya picked an idea to try: "${c.title}" (${c.url})${c.why ? `. Why it matters to them: ${c.why}` : ''}. ` +
-      'Start a SEPARATE session for it with the start_session tool (initiation user_asked, context fresh, its own worktree or a new folder under ~/Projects), with this brief: ' +
-      'build a working first version Soumya can use on the real target within about two hours: a running URL, app or command, not a mock-up or a plan; copy the idea\'s shape, adapt it to Soumya\'s world (Telborg, US data centres and energy, their research and reels), ' +
-      'keep it to one thing done well, write a three-line README on how to try it, take two screenshots of it running, and when it runs report the URL or command with the ledger tool (status implemented, tell todo). ' +
-      'Do not build it in this session; after starting the session, carry on with what you were doing here.',
-    { interrupt: false, start: true },
-  )
-}
-
-// ---------- selling: the CMO's read of the project, from the person's own skill ----------
-
-async function cmoCommand($: $T): Promise<string> {
-  const states = (await allStates($)).filter(st => st.cwd === sessionRoot || (st.project === project && project !== 'This computer'))
-  const reqs = states.flatMap(st => (st.reqs ?? []).filter(r => !isStep(r) && r.status !== 'deferred'))
-  if (!reqs.length) return 'No requirements for this project yet; nothing to review.'
-  const shipped = reqs.filter(r => r.status === 'verified' || r.status === 'implemented')
-  const prompt = `Project: ${project}\n\nShipped or done:\n${shipped.map(r => `- ${r.id} ${r.title}`).join('\n') || '(nothing yet)'}\n\nStill open:\n${reqs.filter(r => !shipped.includes(r)).map(r => `- ${r.id} ${r.title}`).join('\n') || '(none)'}\n\nOutreach so far:\n${reqs.filter(r => r.tell).map(r => `- ${r.id}: ${r.tell?.status}${r.tell?.path ? ` (${r.tell.path})` : ''}`).join('\n') || '(none)'}`
-  const res = await $.model.complete({ model: AUDIT_MODEL, system: CMO_SYSTEM, prompt, maxTokens: 3000 })
-  await tally($, 'cmo', CMO_SYSTEM + prompt, res)
-  if (!res.isAnswered) return `The review model did not answer (${res.reason ?? 'no reason'}).`
-  const r = parseCmo(res.text)
-  if (!r) return 'The review came back in a form Principia could not read.'
-  for (const d of r.decisions) await addSignal($, 'decision', `CMO review: ${d}`)
-  const lines = [`# ${project}: CMO review (${new Date().toISOString().slice(0, 10)})`, '', r.summary, '', `PMF: ${r.pmf}`, '', '## Passes', ...r.passes.map(p => `- ${p.n}. ${p.name}: ${p.score}/10. ${p.gap}`), '', '## Decisions for you', ...r.decisions.map(d => `- ${d}`), '', '## Outreach to make now', ...r.outreach.map(o => `- ${o.what} (for ${o.for})`), '', 'Full nine-pass review with fixes: /plan-cmo-review in a session on this project.']
-  const out = join(plat.data, `cmo-${project.replace(/[^\w.-]+/g, '_')}.md`)
-  await $.fs.write(out, lines.join('\n'))
-  await save($)
-  const low = r.passes.filter(p => p.score < 6).map(p => `${p.name} ${p.score}`).join(', ')
-  return `CMO review written to ${out}. ${r.summary} Weakest: ${low || 'none under 6'}. ${r.decisions.length} decisions added to needs-you.`
 }
 
 // ---------- pane size ----------
@@ -1832,13 +1343,12 @@ export const register: Register = on => {
     })
     // Memory every half minute; the files every five, since sizing a folder costs more.
     $.clock.after(3000, () => void measureFootprint($, true).catch(() => undefined))
-    $.clock.after(90_000, () => void autoJudgeIdeas($).catch(() => undefined))
     $.clock.every(30_000, () => void measureFootprint($, false).catch(() => undefined))
     $.clock.every(300_000, () => void measureFootprint($, true).catch(() => undefined))
     await mirror($)
     // A session started without tools refuses this; the ledger still works without it.
     await $.tool.register({ name: 'ledger', description: TOOL_DESCRIPTION, inputSchema: TOOL_SCHEMA, isDeferred: false }).catch(() => undefined)
-    await $.command.register({ name: 'ledger', description: 'Open the requirements ledger pane', argumentHint: '[window [terminal] | install | refresh | audit [R#…] | brief | cmo | ideas [pull | open | install | build N] | ship R# first|later | nudge on|off | theme … | import [days | refresh | allow | revoke] | wide | narrow]' })
+    await $.command.register({ name: 'ledger', description: 'Open the requirements ledger pane', argumentHint: '[window [terminal] | install | refresh | nudge on|off | theme … | import [days | refresh | allow | revoke] | wide | narrow]' })
     void openPane($)
     return next(e)
   })
@@ -1855,11 +1365,6 @@ export const register: Register = on => {
       return { text: arg === 'nudge off' ? 'Principia will not ask the agent to verify on its own. /ledger nudge on turns it back on; g in the window still asks once.' : 'When a session goes idle with requirements done but not verified, Principia asks the agent to verify them, once each.' }
     }
     if (arg === 'refresh') return { text: await refreshCommand($).catch(err => `Could not refresh: ${err instanceof Error ? err.message : String(err)}`) }
-    if (arg === 'audit' || arg.startsWith('audit ')) return { text: await auditCommand($, raw.slice(5).trim()).catch(err => `Could not audit: ${err instanceof Error ? err.message : String(err)}`) }
-    if (arg === 'brief') return { text: await briefCommand($).catch(err => `Could not write the brief: ${err instanceof Error ? err.message : String(err)}`) }
-    if (arg === 'ideas' || arg.startsWith('ideas ')) return { text: await ideasCommand($, raw.slice(5).trim()).catch(err => `Ideas: ${err instanceof Error ? err.message : String(err)}`) }
-    if (arg === 'cmo') return { text: await cmoCommand($).catch(err => `CMO review: ${err instanceof Error ? err.message : String(err)}`) }
-    if (arg.startsWith('ship ')) return { text: await shipCommand($, raw.slice(5).trim()) }
     if (arg === 'wide' || arg === 'narrow') await $.store.set('width', arg)
     const width = await openPane($)
     return { text: `Principia opened (${width}). /ledger window opens it in your terminal; /ledger theme changes the colours; /ledger wide or /ledger narrow resizes this pane; dragging the pane edge also works.` }
@@ -1984,7 +1489,7 @@ export const register: Register = on => {
           // turns, every open requirement is re-judged against the whole session so far.
           if (turns.length % CONSOLIDATE_EVERY === 0) await consolidate($)
           // Then, if the session stays idle, the agent is asked to verify what it says is done.
-          $.clock.after(NUDGE_AFTER, () => void nudgeOpen($).then(n => (n ? 0 : nudgeTests($))).then(n => (n ? 0 : nudgeVerify($))).then(n => (n ? 0 : nudgeTell($))).catch(() => undefined))
+          $.clock.after(NUDGE_AFTER, () => void nudgeOpen($).then(n => (n ? 0 : nudgeVerify($))).catch(() => undefined))
         }))
       }
       await update($, repliesA, list => list.map(r => (r.delivery === 'received' ? { ...r, delivery: 'acted' as const } : r)))
@@ -2037,16 +1542,14 @@ export const register: Register = on => {
     const [reqs, events, replies, view, signals, plan, previews, turns, footprint] = await Promise.all([
       read($, reqsA), read($, eventsA), read($, repliesA), read($, viewA), read($, signalsA), read($, planA), read($, previewsA), read($, turnsA), read($, footprintA),
     ])
-    const openSignals = signals.filter(x => !x.dismissed && !x.resolvedAt)
+    const openSignals = signals.filter(x => !x.dismissed)
     const p = palette(await read($, themeA), view.dark)
     const setView = (patch: Partial<View>) => update($, viewA, v => ({ ...v, ...patch }))
     const chip = (label: string, tone: Tone) => (
       <Text color={toneFg(p, tone)} backgroundColor={toneBg(p, tone)}> {label} </Text>
     )
     const verified = reqs.filter(r => r.status === 'verified' && !r.needsReverify).length
-    const live = reqs.filter(r => r.status !== 'deferred' && !isStep(r))
-    const guard = guardOf(events)
-    const needsYou = openSignals.filter(s => s.kind === 'decision' || s.kind === 'blocker' || s.kind === 'manual' || s.kind === 'blocked' || s.kind === 'conflict').length
+    const live = reqs.filter(r => r.status !== 'deferred')
 
     const tabs = (
       <Box flexDirection="row" gap={1} paddingBottom={1}>
@@ -2064,13 +1567,8 @@ export const register: Register = on => {
       <Box flexDirection="column" paddingBottom={1}>
         <Text color={p.text} bold>Principia</Text>
         <Text color={p.text2}>
-          {live.length} requirements · <Text color={p.done}>{verified} verified</Text> · {live.length - verified} open{needsYou ? <Text color={p.warn}> · {needsYou} need{needsYou === 1 ? 's' : ''} you</Text> : null}
+          {live.length} requirements · <Text color={p.done}>{verified} verified</Text> · {live.length - verified} open
         </Text>
-        {guard && (
-          <Text color={guard.editsSince ? p.warn : p.done}>
-            {guard.editsSince ? `${guard.editsSince} edit${guard.editsSince === 1 ? '' : 's'} since the last passing test${guard.passedAt ? ` (${hhmm(guard.passedAt)})` : ' (none yet)'}` : `Tests passed ${hhmm(guard.passedAt ?? 0)}, no edits since`}
-          </Text>
-        )}
         {footprint && (
           <Text color={p.text3}>
             {fmtKb(footprint.ramKb)} memory in {footprint.procs} process{footprint.procs === 1 ? '' : 'es'} · {fmtKb(ownKb(footprint))} on disk, local only{footprint.sharedKb ? ` · ${fmtKb(footprint.sharedKb)} shared on the project` : ''} · M in the window for details

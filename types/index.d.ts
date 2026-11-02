@@ -42,11 +42,15 @@ export type Requirement = {
   pokedAt?: number
   // A one-off action in this session (commit, push, run a command), not a lasting property.
   step?: boolean
+  // A standing constraint on how the agent works here ("no DB writes"): held, not built; a breach is a conflict.
+  rule?: boolean
   // Whether the first version can ship without it ('later') or not ('first').
   ship?: 'first' | 'later'
   // Research and writing: the sources the agent attached, and the audit by another model.
   sources?: string[]
   audit?: { at: number; model: string; cleared: boolean; note: string }
+  // Something people should hear about: the outreach for it (a post, a reel, a demo) and where it is.
+  tell?: { status: 'todo' | 'drafted' | 'published'; path?: string; at: number }
 }
 
 // Things worth acting on that are easy to miss in the chat: a tool call that failed or was

@@ -20,9 +20,9 @@ import type {
   Usage,
   View,
 } from '../types'
-import { AUDIT_SYSTEM, FILES_SYSTEM, REVIEW_SYSTEM, TAG_SYSTEM, auditPrompt, buildLedger, filesPrompt, judgeStatuses, parseAudit, parseFiles, parseReview, parseTagged, reviewPrompt, tagPrompt, turnsAsConversation } from './tagging'
+import { AUDIT_SYSTEM, CMO_SYSTEM, FILES_SYSTEM, IDEAS_SYSTEM, REVIEW_SYSTEM, TAG_SYSTEM, auditPrompt, buildLedger, filesPrompt, ideasPrompt, judgeStatuses, parseAudit, parseCmo, parseFiles, parseIdeas, parseReview, parseTagged, reviewPrompt, tagPrompt, turnsAsConversation } from './tagging'
 import type { Complete, LedgerItem, PastPrompt, Progress, Tagged, Turn } from './tagging'
-import { PLAN_TOOLS, REQ_FILTERS, failureText, filterReqs, findCheck, gapOf, guardOf, humanText, isSecretPath, isStep, lastShip, linker, planFrom, previewUrls, sessionKind, shipGate, trimEvents } from './work'
+import { PLAN_TOOLS, REQ_FILTERS, failureText, filterReqs, findCheck, gapOf, guardOf, humanText, isRule, isSecretPath, isStep, lastShip, linker, planFrom, previewUrls, sessionKind, shipGate, trimEvents } from './work'
 import type { ReqFilterName } from './work'
 import { RELEASE } from './release'
 import { FIND_SELF, SHARED_NAMES, appDirs, appRss, cacheDirs, changedPaths, duKb, duLines, fetchedPaths, findCreatedArgs, fmtKb, ignoredPaths, roleOf, statLines, sumKb, touchStamp, treeRss, workspaceOf, writtenPaths } from './footprint'
@@ -156,7 +156,7 @@ async function mirror($: $T) {
     }
     await $.fs.write(stateFile(), JSON.stringify({
       sessionId, project, cwd: sessionRoot, footprint, title, hasEnded, entry, drawn, turns: turns.slice(-400),
-      guard: guardOf(events), kind: sessionKind(events), ship: lastShip(events), usage, allTimeUsage: allTime, files,
+      guard: guardOf(events, sessionRoot), kind: sessionKind(events), ship: lastShip(events), usage, allTimeUsage: allTime, files,
       reqs, replies, events: trimEvents(events), signals: signals.slice(-100), plan, previews,
       isWorking: Boolean(turnId) && !hasEnded, editors: plat.editors, snapDir: join(plat.data, 'snapshots'), theme, dark: view.dark, at: now(),
       transcriptsAllowed: await transcriptsAllowed($),
@@ -295,8 +295,10 @@ async function review($: $T, answer: string, eventId: string, work: string[], as
     const res = await $.model.complete({ model: HAIKU, system: REVIEW_SYSTEM, prompt, maxTokens: 2000 })
     await tally($, 'review', REVIEW_SYSTEM + prompt, res)
     if (!res.isAnswered) return []
-    const { findings, conflicts: against, progress, onYou } = parseReview(res.text)
+    const { findings, conflicts: against, progress, onYou, tellable } = parseReview(res.text)
     await applyProgress($, progress, "Judged from the agent's report")
+    // Something people would notice shipped: its outreach is part of the build, not an afterthought.
+    if (tellable.length) await update($, reqsA, list => list.map(r => (tellable.includes(r.id) && !r.tell && !isStep(r) ? { ...r, tell: { status: 'todo' as const, at: now() } } : r)))
     await resolveSignals($, progress.map(p => p.id))
     const context = { ask: clip(ask, 600), did: work.slice(-8).join('\n'), output: clip(answer, 800) }
     const open = (await read($, signalsA)).filter(s => !s.dismissed && !s.resolvedAt)
@@ -372,9 +374,10 @@ async function capture($: $T, text: string): Promise<string[]> {
         touched.push(`${target.id} (refined): ${t.title}`)
       } else {
         const id = nextId(out)
-        const step = t.kind === 'step'
-        out = [...out, { id, title: t.title, status: 'captured', at: now(), history: [version], evidence: [], ...(step ? { step: true } : {}) }]
-        touched.push(`${id}${step ? ' (step)' : ''}: ${t.title}`)
+        const step = t.kind === 'step', rule = t.kind === 'rule'
+        // A rule is in force from the moment it is said: nothing to start, nothing to verify.
+        out = [...out, { id, title: t.title, status: rule ? 'verified' : 'captured', at: now(), history: [version], evidence: rule ? [{ kind: 'note', at: now(), text: 'A standing rule for this session: held unless a conflict is raised.' }] : [], ...(step ? { step: true } : {}), ...(rule ? { rule: true } : {}) }]
+        touched.push(`${id}${step ? ' (step)' : rule ? ' (rule)' : ''}: ${t.title}`)
       }
     }
     return out
@@ -760,14 +763,14 @@ const NUDGE_AFTER = 20_000
 async function nudgeVerify($: $T): Promise<number> {
   if (hasEnded || (await $.store.get('nudge').catch(() => undefined)) === 'off') return 0
   if (await read($, turnA)) return 0 // a new turn has started; its own review nudges later
-  const due = (await read($, reqsA)).filter(r => r.status === 'implemented' && !r.needsReverify && !r.nudgedAt && !r.manual)
+  const due = (await read($, reqsA)).filter(r => r.status === 'implemented' && !r.needsReverify && !r.nudgedAt && !r.manual && !isRule(r) && !isStep(r))
   if (!due.length) return 0
   await update($, reqsA, list => list.map(r => (due.some(d => d.id === r.id) ? { ...r, nudgedAt: now() } : r)))
   await deliver(
     $,
     `[Ledger] Done but not verified: ${due.map(r => `${r.id} ${r.title}`).join('; ')}. ` +
       `For each, run the command that proves it (a test, build, ffprobe, grep, curl, your own script: any Bash call that exits 0) and report with the ${TOOL} tool (status verified, test_command = a distinctive part of that command). ` +
-      'If one can only be checked by hand (research, writing, a video to watch), update it with manual_check saying what to check; it will not be asked about again.',
+      'If one can only be checked by hand (research, writing, a video to watch), update it with manual_check saying what to check; it will not be asked about again. Answer in one line per item, no tables.',
     { interrupt: false, start: true },
   )
   await save($)
@@ -780,13 +783,13 @@ async function nudgeVerify($: $T): Promise<number> {
 async function nudgeOpen($: $T): Promise<number> {
   if (hasEnded || (await $.store.get('nudge').catch(() => undefined)) === 'off') return 0
   if (await read($, turnA)) return 0
-  const due = (await read($, reqsA)).filter(r => r.status === 'captured' && !r.pokedAt && r.history[0]?.by !== 'agent' && r.at < turnStartedAt)
+  const due = (await read($, reqsA)).filter(r => r.status === 'captured' && !r.pokedAt && r.history[0]?.by !== 'agent' && r.at < turnStartedAt && !isRule(r))
   if (!due.length) return 0
   await update($, reqsA, list => list.map(r => (due.some(d => d.id === r.id) ? { ...r, pokedAt: now() } : r)))
   await deliver(
     $,
     `[Ledger] Asked but not started: ${due.map(r => `${r.id} ${r.title}`).join('; ')}. ` +
-      `Continue with them now. If one cannot be done yet, set its status with the ${TOOL} tool (blocked, needs_clarification or revisit) and say why.`,
+      `Continue with them now. If one cannot be done yet, set its status with the ${TOOL} tool (blocked, needs_clarification or revisit) and say why, in one line each.`,
     { interrupt: false, start: true },
   )
   await save($)
@@ -801,17 +804,41 @@ async function nudgeTests($: $T): Promise<number> {
   if (hasEnded || (await $.store.get('nudge').catch(() => undefined)) === 'off') return 0
   if (await read($, turnA)) return 0
   const events = await read($, eventsA)
-  const guard = guardOf(events)
-  const lastEdit = Math.max(0, ...events.filter(e => e.kind === 'code').map(e => e.at))
+  const guard = guardOf(events, sessionRoot)
+  const lastEdit = Math.max(0, ...events.filter(e => e.kind === 'code' && (!sessionRoot || (e.file ?? '').startsWith(sessionRoot))).map(e => e.at))
   if (!guard || !guard.editsSince || lastEdit <= testNudgedAt) return 0
   testNudgedAt = now()
   await deliver(
     $,
     `[Ledger] ${guard.editsSince} edit${guard.editsSince === 1 ? '' : 's'} since the last passing test run${guard.command ? ` (${guard.command}, ${hhmm(guard.passedAt ?? 0)})` : ' (none in this session yet)'}: ${guard.edited.join(', ')}. ` +
-      `Run the project's tests (or the check that covers these files) before moving on, and report with the ${TOOL} tool. If they fail, say so and fix them first.`,
+      `Run the project's tests (or the check that covers these files) before moving on, and report with the ${TOOL} tool. If they fail, say so and fix them first. Answer in one line per item, no tables.`,
     { interrupt: false, start: true },
   )
   return 1
+}
+
+// Building is half the work; people have to hear about it. When a session goes idle with a
+// feature finished that a customer would notice and nothing written about it, the agent is
+// asked once to make the outreach now, alongside the code: a post, a reel script, a changelog
+// line, and the screenshots or recording to show it. From the person's own CMO review skill:
+// make not marketing harder than marketing.
+async function nudgeTell($: $T): Promise<number> {
+  if (hasEnded || (await $.store.get('nudge').catch(() => undefined)) === 'off') return 0
+  if (await read($, turnA)) return 0
+  const due = (await read($, reqsA)).filter(r => r.tell?.status === 'todo' && !r.tell.path && (r.status === 'implemented' || r.status === 'verified'))
+  if (!due.length) return 0
+  await update($, reqsA, list => list.map(r => (due.some(d => d.id === r.id) ? { ...r, tell: { ...(r.tell as NonNullable<Requirement['tell']>), path: '(asked)' } } : r)))
+  const folder = sessionRoot ? join(sessionRoot, 'marketing') : 'the notes folder'
+  await deliver(
+    $,
+    `[Ledger] Shipped and worth telling people about: ${due.map(r => `${r.id} ${r.title}`).join('; ')}. ` +
+      `Write the outreach now, as part of the build, one folder per item in ${folder}/<slug>/: (1) post.md, a 120-word post in Soumya's own voice for LinkedIn and X, leading with what the reader can now do; ` +
+      '(2) reel.md, a 30-second reel script: hook line, three beats, close; (3) one changelog line; (4) the pictures: decide which screenshots or a short screen recording show it best (the feature in use, before and after, at desktop and phone widths), ' +
+      'take them yourself with the browser or preview tools you have, save them in the folder, and list what each shows; (5) who exactly should see it first. ' +
+      `No hype words. Then report with the ${TOOL} tool (tell "drafted", tell_path the folder). If an item is not worth telling anyone about, say so with tell "published" and a note.`,
+    { interrupt: false, start: true },
+  )
+  return due.length
 }
 
 // A requirement the agent (or a refinement from you) takes out of "done" is nudged again the
@@ -827,6 +854,7 @@ type InboxCommand =
   | { seq: number; type: 'detach'; reqId: string; index: number }
   | { seq: number; type: 'dismiss'; signalId: string }
   | { seq: number; type: 'gaps' }
+  | { seq: number; type: 'build'; url: string; title: string; why?: string }
 
 // A conflict is settled by the person, not the agent: this clears the flag and its signals.
 async function resolveConflict($: $T, id: string) {
@@ -883,6 +911,8 @@ async function pollInbox($: $T) {
       await save($)
     } else if (c.type === 'gaps') {
       await askGaps($)
+    } else if (c.type === 'build') {
+      await buildIdea($, c)
     }
   }
 }
@@ -1355,6 +1385,7 @@ const TOOL_DESCRIPTION =
   'set manual_check to what a person should check: the requirement stays "done, not verified" and is not asked about again. ' +
   'In a research or writing session "verified" instead needs sources (the links or documents behind the answer) and an audit by another model that cleared it (/ledger audit); pass sources when you report. ' +
   'ship: "first" when the first version cannot ship without it, "later" when it can wait. ' +
+  'tell: outreach is part of the build; when a feature people would notice is done, write its post, reel script and changelog line, take its screenshots, and report tell "drafted" with tell_path. ' +
   'Start plan and todo items with the ids they serve, e.g. "[R2] Add search".'
 
 const TOOL_SCHEMA = {
@@ -1366,6 +1397,8 @@ const TOOL_SCHEMA = {
     test_command: { type: 'string', description: 'verified: part of a Bash command that exited 0 after your last edit' },
     manual_check: { type: 'string', description: 'what a person should check when nothing can be run; stops the verify nudge for this requirement' },
     sources: { type: 'string', description: 'research/writing: the sources behind the answer, one per line (URLs, file paths, document names)' },
+    tell: { type: 'string', enum: ['todo', 'drafted', 'published'], description: 'outreach for this: todo (worth telling people), drafted (written, give tell_path), published' },
+    tell_path: { type: 'string', description: 'where the outreach draft is' },
     ship: { type: 'string', enum: ['first', 'later'], description: 'whether the first version can ship without this' },
     note: { type: 'string' },
     title: { type: 'string', description: 'add: the new requirement' },
@@ -1442,6 +1475,7 @@ async function ledgerTool($: $T, a: Record<string, unknown>): Promise<string> {
         ...base, status, evidence, manual,
         sources: sources.length ? sources : r.sources,
         ship: s('ship') === 'first' || s('ship') === 'later' ? (s('ship') as 'first' | 'later') : r.ship,
+        tell: ['todo', 'drafted', 'published'].includes(s('tell')) ? { status: s('tell') as 'todo' | 'drafted' | 'published', path: s('tell_path') || r.tell?.path, at: now() } : r.tell,
         // A check by hand counts as this session's one nudge: it is not asked about again.
         nudgedAt: manual ? base.nudgedAt ?? now() : base.nudgedAt,
         needsReverify: status === 'verified' ? false : r.needsReverify,
@@ -1550,6 +1584,171 @@ async function briefCommand($: $T): Promise<string> {
   return `Brief written to ${out} (${all.length} requirements from ${states.length} sessions, ${gate.first.length} open before the first version ships, ${gate.onYou.length} waiting on you). Paste it into a new session, or start one with it. ${mine.length ? '' : 'This session has no ledger of its own yet.'}`
 }
 
+// ---------- what this person works on, for judges that need to know ----------
+
+type AnyState = { sessionId: string; project?: string; cwd?: string; title?: string; at?: number; reqs?: Requirement[]; signals?: Signal[]; ship?: { at: number; command: string }; kind?: string }
+async function allStates($: $T): Promise<AnyState[]> {
+  const files = await $.fs.list(plat.data).catch(() => [] as { name: string }[])
+  const out: AnyState[] = []
+  for (const f of files) {
+    if (!/^state-.*\.json$/.test(f.name)) continue
+    const st = await $.fs.read(join(plat.data, f.name)).then(t => JSON.parse(String(t)) as AnyState).catch(() => undefined)
+    if (st) out.push(st)
+  }
+  return out
+}
+
+// Projects, what they ask for, and the research titles: built from Principia's own ledgers.
+async function profileText($: $T): Promise<string> {
+  const states = (await allStates($)).sort((a, b) => (b.at ?? 0) - (a.at ?? 0))
+  const byProject = new Map<string, string[]>()
+  for (const st of states) {
+    const name = st.project && st.project !== 'This computer' ? st.project : `research: ${clip(st.title ?? '', 60)}`
+    const titles = (st.reqs ?? []).filter(r => !isStep(r) && r.status !== 'deferred').slice(-12).map(r => r.title)
+    byProject.set(name, [...(byProject.get(name) ?? []), ...titles].slice(0, 14))
+  }
+  return [...byProject.entries()].slice(0, 16).map(([p, t]) => `- ${p}: ${t.join('; ')}`).join('\n') || '(no projects yet)'
+}
+
+// ---------- ideas: what others publish, judged for this person ----------
+
+const ideasDir = () => join(plat.data, 'ideas')
+type Idea = { source: string; via: string; title: string; url: string; hn?: string; points?: number; comments?: number; by?: string; at?: string; summary?: string; kind?: string }
+type Pick = Idea & { score: number; buckets: string[]; project?: string; why: string; judgedAt: number; kept?: boolean; tried?: boolean; dropped?: boolean; tryUrl?: string; built?: { at: number; brief: string } }
+
+async function readJsonl<T>($: $T, file: string): Promise<T[]> {
+  const text = await $.fs.read(file).then(String).catch(() => '')
+  return text.split('\n').filter(Boolean).flatMap(l => { try { return [JSON.parse(l) as T] } catch { return [] } })
+}
+async function readPicks($: $T): Promise<Pick[]> {
+  return await $.fs.read(join(ideasDir(), 'picks.json')).then(t => JSON.parse(String(t)) as Pick[]).catch(() => [] as Pick[])
+}
+const openPage = async ($: $T, page: string) => run($, plat.os === 'mac' ? ['open', page] : plat.os === 'windows' ? ['cmd', '/c', 'start', '', page] : ['xdg-open', page])
+
+// New items since the last judgement go to Haiku in batches with the profile; 6 and above are
+// kept as picks. Runs on /ledger ideas and, by itself, once a session has been open a while
+// and the last judgement is more than six hours old.
+async function judgeIdeas($: $T): Promise<string> {
+  const items = await readJsonl<Idea>($, join(ideasDir(), 'items.jsonl'))
+  if (!items.length) return 'No items pulled yet: /ledger ideas pull.'
+  const picks = await readPicks($)
+  const judged = new Set<string>((await $.fs.read(join(ideasDir(), 'judged.txt')).then(String).catch(() => '')).split('\n').filter(Boolean))
+  const todo = items.filter(it => !judged.has(it.url)).slice(0, 120)
+  if (!todo.length) return `Nothing new to judge (${items.length} items, ${picks.filter(p => !p.dropped).length} picks).`
+  const profile = await profileText($)
+  let added = 0
+  for (let i = 0; i < todo.length; i += 25) {
+    const batch = todo.slice(i, i + 25)
+    const prompt = ideasPrompt(profile, batch)
+    const res = await $.model.complete({ model: HAIKU, system: IDEAS_SYSTEM, prompt, maxTokens: 2500 })
+    await tally($, 'ideas', IDEAS_SYSTEM + prompt, res)
+    if (!res.isAnswered) continue
+    for (const v of parseIdeas(res.text, batch)) {
+      const it = batch.find(b => b.url === v.url)
+      if (it && v.score >= 6 && v.buckets.length && !picks.some(p => p.url === v.url)) { picks.push({ ...it, score: v.score, buckets: v.buckets, project: v.project, why: v.why, judgedAt: now() }); added++ }
+    }
+    for (const b of batch) judged.add(b.url)
+  }
+  await $.fs.write(join(ideasDir(), 'judged.txt'), [...judged].join('\n'))
+  await $.fs.write(join(ideasDir(), 'picks.json'), JSON.stringify(picks, null, 1))
+  await $.store.set('ideas.judgedAt', now()).catch(() => undefined)
+  if (plat.runner.length) await run($, programArgs('ideas-gallery', ideasDir()), 120_000)
+  return `Judged ${todo.length} new items against your projects: ${added} picked (${picks.filter(p => !p.dropped).length} picks in all).`
+}
+
+async function ideasCommand($: $T, arg: string): Promise<string> {
+  const [verb = '', ...rest] = arg.split(/\s+/).filter(Boolean)
+  if (!plat.runner.length && verb !== 'open') return 'The Principia program is not installed (/ledger install); it does the pulling.'
+  if (verb === 'pull') {
+    const r = await run($, programArgs('ideas-pull', ideasDir()), 180_000)
+    await $.store.set('ideas.pulledAt', now()).catch(() => undefined)
+    return r?.exitCode === 0 ? `${firstLine(r.stdout)}. /ledger ideas judges them.` : `Pull failed: ${r?.stderr.trim() || 'no output'}`
+  }
+  if (verb === 'open') {
+    const page = join(ideasDir(), 'gallery.html')
+    if (!(await $.fs.exists(page))) return 'No gallery yet: /ledger ideas first.'
+    await openPage($, page)
+    return `Opened ${page}.`
+  }
+  if (verb === 'install') {
+    if (plat.os !== 'mac') return 'Scheduled pulls are set up with launchd on macOS only so far; elsewhere, run "principia ideas-pull" from cron.'
+    const home = (await $.env.get('HOME')) ?? ''
+    const plist = join(home, 'Library', 'LaunchAgents', 'com.principia.ideas.plist')
+    const program = plat.runner[0] as string
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n  <key>Label</key><string>com.principia.ideas</string>\n  <key>ProgramArguments</key><array><string>${program}</string><string>ideas-pull</string><string>${ideasDir()}</string></array>\n  <key>StartCalendarInterval</key><array>\n    <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>30</integer></dict>\n    <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>0</integer></dict>\n    <dict><key>Hour</key><integer>20</integer><key>Minute</key><integer>0</integer></dict>\n  </array>\n  <key>StandardOutPath</key><string>${join(ideasDir(), 'pull.log')}</string>\n  <key>StandardErrorPath</key><string>${join(ideasDir(), 'pull.log')}</string>\n</dict></plist>\n`
+    await $.fs.write(plist, xml)
+    const uid = firstLine((await run($, ['id', '-u']))?.stdout) || '501'
+    await run($, ['launchctl', 'bootout', `gui/${uid}`, plist])
+    const r = await run($, ['launchctl', 'bootstrap', `gui/${uid}`, plist])
+    return r?.exitCode === 0 ? `Scheduled: the puller runs at 07:30, 13:00 and 20:00 (${plist}). Judging happens when a session is open, or with /ledger ideas.` : `Could not schedule: ${r?.stderr.trim() || 'launchctl gave no output'}. The plist is at ${plist}.`
+  }
+  if (verb === 'build') {
+    const n = Number(rest[0])
+    const picks = (await readPicks($)).filter(p => !p.dropped).sort((a, b) => b.score - a.score)
+    const pick = picks[n - 1]
+    if (!pick) return `No pick ${rest[0] ?? ''}. Picks are numbered in the window's Ideas view (I).`
+    await buildIdea($, { url: pick.url, title: pick.title, why: pick.why })
+    return `Asked the agent to start a separate session that builds a V1 of "${pick.title}" for you to try.`
+  }
+  // Plain /ledger ideas: pull if stale, judge, build the gallery, open it.
+  const last = Number(await $.store.get('ideas.pulledAt').catch(() => 0)) || 0
+  let pulled = ''
+  if (now() - last > 6 * 3_600_000) {
+    const r = await run($, programArgs('ideas-pull', ideasDir()), 180_000)
+    pulled = r?.exitCode === 0 ? `${firstLine(r.stdout)}. ` : ''
+    await $.store.set('ideas.pulledAt', now()).catch(() => undefined)
+  }
+  const said = await judgeIdeas($)
+  const page = join(ideasDir(), 'gallery.html')
+  if (await $.fs.exists(page)) await openPage($, page)
+  return `${pulled}${said} The gallery is open in your browser; I in the window lists the picks (k keep, t tried, x drop, b build a V1).`
+}
+
+// Once a session has been open a while, new items are judged on their own, at most every six hours.
+async function autoJudgeIdeas($: $T) {
+  const last = Number(await $.store.get('ideas.judgedAt').catch(() => 0)) || 0
+  if (now() - last < 6 * 3_600_000 || !(await $.fs.exists(join(ideasDir(), 'items.jsonl')))) return
+  await judgeIdeas($).catch(() => undefined)
+}
+
+// A pick becomes a thing to try: the agent in this session is told to start a separate session
+// whose only deliverable is a working first version on the real target, for the person to use.
+async function buildIdea($: $T, c: { url: string; title: string; why?: string }) {
+  const picks = await readPicks($)
+  await $.fs.write(join(ideasDir(), 'picks.json'), JSON.stringify(picks.map(p => (p.url === c.url ? { ...p, tried: true, built: { at: now(), brief: c.title } } : p)), null, 1))
+  await deliver(
+    $,
+    `[Ledger] Soumya picked an idea to try: "${c.title}" (${c.url})${c.why ? `. Why it matters to them: ${c.why}` : ''}. ` +
+      'Start a SEPARATE session for it with the start_session tool (initiation user_asked, context fresh, its own worktree or a new folder under ~/Projects), with this brief: ' +
+      'build a working first version Soumya can use on the real target within about two hours: a running URL, app or command, not a mock-up or a plan; copy the idea\'s shape, adapt it to Soumya\'s world (Telborg, US data centres and energy, their research and reels), ' +
+      'keep it to one thing done well, write a three-line README on how to try it, take two screenshots of it running, and when it runs report the URL or command with the ledger tool (status implemented, tell todo). ' +
+      'Do not build it in this session; after starting the session, carry on with what you were doing here.',
+    { interrupt: false, start: true },
+  )
+}
+
+// ---------- selling: the CMO's read of the project, from the person's own skill ----------
+
+async function cmoCommand($: $T): Promise<string> {
+  const states = (await allStates($)).filter(st => st.cwd === sessionRoot || (st.project === project && project !== 'This computer'))
+  const reqs = states.flatMap(st => (st.reqs ?? []).filter(r => !isStep(r) && r.status !== 'deferred'))
+  if (!reqs.length) return 'No requirements for this project yet; nothing to review.'
+  const shipped = reqs.filter(r => r.status === 'verified' || r.status === 'implemented')
+  const prompt = `Project: ${project}\n\nShipped or done:\n${shipped.map(r => `- ${r.id} ${r.title}`).join('\n') || '(nothing yet)'}\n\nStill open:\n${reqs.filter(r => !shipped.includes(r)).map(r => `- ${r.id} ${r.title}`).join('\n') || '(none)'}\n\nOutreach so far:\n${reqs.filter(r => r.tell).map(r => `- ${r.id}: ${r.tell?.status}${r.tell?.path ? ` (${r.tell.path})` : ''}`).join('\n') || '(none)'}`
+  const res = await $.model.complete({ model: AUDIT_MODEL, system: CMO_SYSTEM, prompt, maxTokens: 3000 })
+  await tally($, 'cmo', CMO_SYSTEM + prompt, res)
+  if (!res.isAnswered) return `The review model did not answer (${res.reason ?? 'no reason'}).`
+  const r = parseCmo(res.text)
+  if (!r) return 'The review came back in a form Principia could not read.'
+  for (const d of r.decisions) await addSignal($, 'decision', `CMO review: ${d}`)
+  const lines = [`# ${project}: CMO review (${new Date().toISOString().slice(0, 10)})`, '', r.summary, '', `PMF: ${r.pmf}`, '', '## Passes', ...r.passes.map(p => `- ${p.n}. ${p.name}: ${p.score}/10. ${p.gap}`), '', '## Decisions for you', ...r.decisions.map(d => `- ${d}`), '', '## Outreach to make now', ...r.outreach.map(o => `- ${o.what} (for ${o.for})`), '', 'Full nine-pass review with fixes: /plan-cmo-review in a session on this project.']
+  const out = join(plat.data, `cmo-${project.replace(/[^\w.-]+/g, '_')}.md`)
+  await $.fs.write(out, lines.join('\n'))
+  await save($)
+  const low = r.passes.filter(p => p.score < 6).map(p => `${p.name} ${p.score}`).join(', ')
+  return `CMO review written to ${out}. ${r.summary} Weakest: ${low || 'none under 6'}. ${r.decisions.length} decisions added to needs-you.`
+}
+
 // ---------- pane size ----------
 
 // A pane can only ask for a width; the person's own drag on the dock wins.
@@ -1633,12 +1832,13 @@ export const register: Register = on => {
     })
     // Memory every half minute; the files every five, since sizing a folder costs more.
     $.clock.after(3000, () => void measureFootprint($, true).catch(() => undefined))
+    $.clock.after(90_000, () => void autoJudgeIdeas($).catch(() => undefined))
     $.clock.every(30_000, () => void measureFootprint($, false).catch(() => undefined))
     $.clock.every(300_000, () => void measureFootprint($, true).catch(() => undefined))
     await mirror($)
     // A session started without tools refuses this; the ledger still works without it.
     await $.tool.register({ name: 'ledger', description: TOOL_DESCRIPTION, inputSchema: TOOL_SCHEMA, isDeferred: false }).catch(() => undefined)
-    await $.command.register({ name: 'ledger', description: 'Open the requirements ledger pane', argumentHint: '[window [terminal] | install | refresh | audit [R#…] | brief | ship R# first|later | nudge on|off | theme … | import [days | refresh | allow | revoke] | wide | narrow]' })
+    await $.command.register({ name: 'ledger', description: 'Open the requirements ledger pane', argumentHint: '[window [terminal] | install | refresh | audit [R#…] | brief | cmo | ideas [pull | open | install | build N] | ship R# first|later | nudge on|off | theme … | import [days | refresh | allow | revoke] | wide | narrow]' })
     void openPane($)
     return next(e)
   })
@@ -1657,6 +1857,8 @@ export const register: Register = on => {
     if (arg === 'refresh') return { text: await refreshCommand($).catch(err => `Could not refresh: ${err instanceof Error ? err.message : String(err)}`) }
     if (arg === 'audit' || arg.startsWith('audit ')) return { text: await auditCommand($, raw.slice(5).trim()).catch(err => `Could not audit: ${err instanceof Error ? err.message : String(err)}`) }
     if (arg === 'brief') return { text: await briefCommand($).catch(err => `Could not write the brief: ${err instanceof Error ? err.message : String(err)}`) }
+    if (arg === 'ideas' || arg.startsWith('ideas ')) return { text: await ideasCommand($, raw.slice(5).trim()).catch(err => `Ideas: ${err instanceof Error ? err.message : String(err)}`) }
+    if (arg === 'cmo') return { text: await cmoCommand($).catch(err => `CMO review: ${err instanceof Error ? err.message : String(err)}`) }
     if (arg.startsWith('ship ')) return { text: await shipCommand($, raw.slice(5).trim()) }
     if (arg === 'wide' || arg === 'narrow') await $.store.set('width', arg)
     const width = await openPane($)
@@ -1782,7 +1984,7 @@ export const register: Register = on => {
           // turns, every open requirement is re-judged against the whole session so far.
           if (turns.length % CONSOLIDATE_EVERY === 0) await consolidate($)
           // Then, if the session stays idle, the agent is asked to verify what it says is done.
-          $.clock.after(NUDGE_AFTER, () => void nudgeOpen($).then(n => (n ? 0 : nudgeTests($))).then(n => (n ? 0 : nudgeVerify($))).catch(() => undefined))
+          $.clock.after(NUDGE_AFTER, () => void nudgeOpen($).then(n => (n ? 0 : nudgeTests($))).then(n => (n ? 0 : nudgeVerify($))).then(n => (n ? 0 : nudgeTell($))).catch(() => undefined))
         }))
       }
       await update($, repliesA, list => list.map(r => (r.delivery === 'received' ? { ...r, delivery: 'acted' as const } : r)))

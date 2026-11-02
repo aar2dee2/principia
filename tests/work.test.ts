@@ -2,7 +2,7 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import type { Requirement } from '../types'
 import { filterReqs, findCheck, gapOf, guardOf, humanText, lastShip, linkStep, linker, planFrom, previewUrls, sessionKind, shipGate, trimEvents } from '../hooks/work'
-import { parseAudit, parseFiles, parseReview, parseTagged } from '../hooks/tagging'
+import { parseAudit, parseCmo, parseFiles, parseIdeas, parseReview, parseTagged } from '../hooks/tagging'
 import { appDirs, appRss, cacheDirs, changedPaths, duKb, duLines, fetchedPaths, findCreatedArgs, fmtKb, ignoredPaths, roleOf, statLines, sumKb, touchStamp, treeRss, workspaceOf, writtenPaths } from '../hooks/footprint'
 
 const req = (id: string, title: string, extra: Partial<Requirement> = {}): Requirement => ({
@@ -44,7 +44,7 @@ describe('signals and previews', () => {
     const r = parseReview('{"findings":[{"text":"The cache is shared across users"}],"conflicts":[{"id":"R2","reason":"wrote to /tmp"}]}')
     expect(r.findings.length).toBe(1)
     expect(r.conflicts[0]?.id).toBe('R2')
-    expect(parseReview('not json')).toEqual({ findings: [], conflicts: [], progress: [], onYou: [] })
+    expect(parseReview('not json')).toEqual({ findings: [], conflicts: [], progress: [], onYou: [], tellable: [] })
   })
   test('the tagger can flag a conflict', async () => {
     const t = parseTagged('{"items":[{"title":"Remove search","quote":"drop search","refines":null,"conflicts":"R3","conflict_reason":"R3 adds search"}]}')
@@ -335,5 +335,11 @@ describe('regression guard, session kind, shipping', () => {
     expect(r.onYou).toEqual([{ text: 'Run the release command', kind: 'blocker', id: 'R15' }])
     expect(parseAudit('{"items":[{"id":"R2","cleared":false,"note":"no source for the 40% figure"}]}')).toEqual([{ id: 'R2', cleared: false, note: 'no source for the 40% figure' }])
     expect(parseFiles('{"files":[{"path":"/p/x.md","why":"a report","contains":"notes","use":"a report for the person"}]}')[0]?.use).toBe('a report for the person')
+    expect(parseReview('{"findings":[],"on_you":[],"conflicts":[],"progress":[],"tellable":["R3","nope"]}').tellable).toEqual(['R3'])
+    const ideas = parseIdeas('{"items":[{"n":1,"score":8,"buckets":["pattern","try","bogus"],"project":null,"why":"copy the deploy habit"},{"n":2,"score":"x"},{"n":9,"score":5}]}', [{ url: 'a' }, { url: 'b' }])
+    expect(ideas).toEqual([{ url: 'a', score: 8, buckets: ['pattern', 'try'], project: undefined, why: 'copy the deploy habit' }])
+    const cmo = parseCmo('{"passes":[{"n":1,"name":"positioning","score":4,"gap":"no one-sentence pitch"}],"decisions":["price"],"outreach":[{"what":"a post","for":"LinkedIn"}],"pmf":"pre","summary":"s"}')
+    expect(cmo?.passes[0]?.score).toBe(4)
+    expect(parseCmo('nope')).toBeUndefined()
   })
 })

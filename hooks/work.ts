@@ -85,6 +85,8 @@ export const isVerified = (r: Requirement) => r.status === 'verified' && !r.need
 // an untagged requirement is judged; a tag from the tagger always wins.
 const STEP_RE = /^(commit|push (the|all|it|this)|bump|run (the |a |\/)?(tests?|build|script|command|import|ledger)|rerun|re-run|(re)?install (the |this )?plugin|restart|start a new|open the (window|dashboard|pane|terminal)|tell (me|the user)|create (a|the) (github )?release|release (it|the|v)|upload (the )?(binaries|assets|release)|check in|redo the import|delete .*(state|temp|tmp) files)/i
 export const isStep = (r: Pick<Requirement, 'step' | 'title'>) => (r.step !== undefined ? r.step : STEP_RE.test(r.title.trim()))
+const RULE_RE = /^(do not|don't|never|no |always |ask (me |before)|review (before|every)|keep .* (read-only|unchanged)|without (writing|touching|changing))/i
+export const isRule = (r: Pick<Requirement, 'rule' | 'title'>) => (r.rule !== undefined ? r.rule : RULE_RE.test(r.title.trim()))
 
 export function filterReqs(reqs: Requirement[], query: string, filter: ReqFilterName): Requirement[] {
   const q = query.trim().toLowerCase()
@@ -228,10 +230,13 @@ export type Guard = { command?: string; passedAt?: number; editsSince: number; e
 
 // Edits after the last passing test run (Edit/Write calls, and commands that name a file they
 // write to). No guard when the session has neither edited nor tested.
-export function guardOf(events: ActivityEvent[]): Guard | undefined {
+export function guardOf(events: ActivityEvent[], root = ''): Guard | undefined {
   const pass = [...events].reverse().find(e => e.kind === 'test' && e.state === 'ok')
   const since = pass?.at ?? 0
-  const edits = events.filter(e => e.at > since && (e.kind === 'code' || ((e.kind === 'command') && /(^|[^<>&\d])>{1,2}\s*[^\s;&|]|\bsed\s+-i\b|\btee\s/.test(e.detail ?? ''))))
+  // Only edits inside the project count: notes, downloads and scratch files are not what the
+  // tests cover, and counting them sent the agent to run tests over research sessions.
+  const inProject = (e: ActivityEvent) => !root || (e.file ? e.file.startsWith(root) && !/\/(notes?|docs?\/notes|marketing)\//.test(e.file) : (e.detail ?? '').includes(root) || !/\/(tmp|Library|side-session-notes|\.claude\/principia)\//.test(e.detail ?? ''))
+  const edits = events.filter(e => e.at > since && inProject(e) && (e.kind === 'code' || ((e.kind === 'command') && /(^|[^<>&\d])>{1,2}\s*[^\s;&|]|\bsed\s+-i\b|\btee\s/.test(e.detail ?? ''))))
   if (!pass && !edits.length) return undefined
   const edited = [...new Set(edits.map(e => e.file ? e.file.split(/[\\/]/).pop() ?? e.file : e.title))].slice(0, 6)
   return { command: pass?.detail ? squash(pass.detail).slice(0, 120) : undefined, passedAt: pass?.at, editsSince: edits.length, edited }
@@ -267,10 +272,10 @@ export function lastShip(events: ActivityEvent[]): Ship | undefined {
 // What stands between the work and shipping: requirements for the first version that are not
 // done, and what the person must do or decide. 'later' items are shown apart.
 export function shipGate(reqs: Requirement[], signals: { kind: string; reqId?: string; dismissed?: boolean; resolvedAt?: number; text: string }[]) {
-  const open = (r: Requirement) => r.status !== 'verified' && r.status !== 'revisit' && r.status !== 'deferred' && !isStep(r)
+  const open = (r: Requirement) => r.status !== 'verified' && r.status !== 'revisit' && r.status !== 'deferred' && !isStep(r) && !isRule(r)
   const first = reqs.filter(r => open(r) && r.ship !== 'later')
   const later = reqs.filter(r => open(r) && r.ship === 'later')
   const onYou = signals.filter(s => !s.dismissed && !s.resolvedAt && (s.kind === 'decision' || s.kind === 'blocker' || s.kind === 'manual' || s.kind === 'blocked'))
-  const unverified = reqs.filter(r => r.status === 'implemented' && !isStep(r))
+  const unverified = reqs.filter(r => r.status === 'implemented' && !isStep(r) && !isRule(r))
   return { first, later, onYou, unverified }
 }

@@ -22,10 +22,16 @@ if (cmd === 'view') {
   const { showDiff } = await import('./diff.mjs')
   showDiff(args[0] ?? '', args[1] ?? '')
   process.exit(0)
+} else if (cmd === 'ideas-pull') {
+  process.argv = [process.argv[0], 'ideas-pull', ...args]
+  await import('../ideas/pull.mjs')
+} else if (cmd === 'ideas-gallery') {
+  process.argv = [process.argv[0], 'ideas-gallery', ...args]
+  await import('../ideas/gallery.mjs')
 } else if (cmd === '--version' || cmd === 'version') {
   // Set by scripts/build.ts from plugin.json; "dev" when run from source.
   console.log(`principia ${typeof PRINCIPIA_VERSION === 'string' ? PRINCIPIA_VERSION : 'dev'}`)
 } else {
-  console.error('usage: principia view <data dir> [session] [projects dir] | import … | diff <snapshot> <file>')
+  console.error('usage: principia view <data dir> [session] [projects dir] | import … | diff <snapshot> <file> | ideas-pull [dir] | ideas-gallery [dir]')
   process.exit(2)
 }

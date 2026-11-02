@@ -60,12 +60,12 @@ const savePrefs = () => { try { fs.writeFileSync(PREFS, JSON.stringify(prefs)) }
 const EMPTY = { reqs: [], events: [], replies: [], signals: [], plan: [], previews: [], editors: [], isWorking: false, title: '', project: '' }
 let S = EMPTY
 let focus = 'reqs' // sessions | reqs | signals | middle
-let middle = 'activity' // activity | plan | tests | preview | files | findings | footprint | project
+let middle = 'activity' // activity | plan | tests | preview | files | findings | footprint | project | ideas
 let showAll = false
 let allActivity = false // A: every event, not only the requirement in view's
 let search = ''
 let reqFilter = 'all'
-const sel = { reqs: 0, signals: 0, activity: 0, plan: 0, tests: 0, preview: 0, footprint: 0, files: 0, findings: 0, project: 0 }
+const sel = { reqs: 0, signals: 0, activity: 0, plan: 0, tests: 0, preview: 0, footprint: 0, files: 0, findings: 0, project: 0, ideas: 0 }
 let compose = null // { mode, text, interrupt, eventId, refines } | { mode: 'search', text }
 let flash = ''
 // Commands are ordered by time across windows: the session keeps only ones newer than the last.
@@ -256,6 +256,24 @@ const shownReqs = () => filterReqs(S.reqs, search, reqFilter)
 const openSignals = () => (S.signals ?? []).filter(x => !x.dismissed && !x.resolvedAt && NEEDS_YOU.has(x.kind)).slice().reverse()
 const findings = () => (S.signals ?? []).filter(x => !x.dismissed && !x.resolvedAt && x.kind === 'finding').slice().reverse()
 const sessionFiles = () => [...(S.files ?? [])].reverse()
+// Ideas: what others published, judged for you by the plugin; marks are written straight back.
+const IDEAS = path.join(dir, 'ideas', 'picks.json')
+let ideasCache = { mtime: 0, list: [] }
+function ideas() {
+  try {
+    const mtime = fs.statSync(IDEAS).mtimeMs
+    if (mtime !== ideasCache.mtime) ideasCache = { mtime, list: JSON.parse(fs.readFileSync(IDEAS, 'utf8')) }
+  } catch { ideasCache = { mtime: 0, list: [] } }
+  return ideasCache.list.filter(p => !p.dropped).sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+}
+function markIdea(url, patch) {
+  try {
+    const all = JSON.parse(fs.readFileSync(IDEAS, 'utf8'))
+    fs.writeFileSync(IDEAS, JSON.stringify(all.map(p => (p.url === url ? { ...p, ...patch } : p)), null, 1))
+    ideasCache.mtime = 0
+  } catch { /* no picks yet */ }
+}
+const IDEA_BUCKET = { project: ['For a project', 'active'], pattern: ['Way of working', 'done'], craft: ['Craft', 'done'], weird: ['Weird', 'warn'], try: ['Try it', 'active'] }
 // The requirement in view: the one selected in the requirements column, wherever focus is.
 const reqInView = () => shownReqs()[sel.reqs]
 // Which requirements each event was for: its own links, else worked out from when you asked.
@@ -356,7 +374,7 @@ function signalLines(w, heading = true) {
 }
 
 function middleLines(w, withSignals) {
-  const tabs = [['activity', `1 Activity`], ['plan', `2 Plan`], ['tests', `3 Tests`], ['preview', `4 Preview`], ['files', `6 Files`], ['findings', `7 Found ${findings().length}`], ['footprint', 'M Footprint'], ['project', 'P Project']]
+  const tabs = [['activity', `1 Activity`], ['plan', `2 Plan`], ['tests', `3 Tests`], ['preview', `4 Preview`], ['files', `6 Files`], ['findings', `7 Found ${findings().length}`], ['footprint', 'M Footprint'], ['project', 'P Project'], ['ideas', `I Ideas ${ideas().filter(p => !p.kept && !p.tried).length}`]]
   const lines = [tabs.flatMap(([id, label]) => [seg(` ${label} `, middle === id ? P.text : P.text3, middle === id ? P.surface2 : undefined, middle === id), seg(' ')]), []]
   const isSel = (list, i) => focus === 'middle' && i === sel[list]
   if (middle === 'signals') return [...lines, ...signalLines(w, false)]
@@ -383,6 +401,19 @@ function middleLines(w, withSignals) {
     return lines
   }
   if (middle === 'project') return [...lines, ...projectLines(w, isSel)]
+  if (middle === 'ideas') {
+    const list = ideas()
+    lines.push(...wrap(`What others published lately, judged against your projects. ${list.length} picks · enter opens it · k keep · t tried · x drop · b build a V1 to try · G the gallery with pictures.`, w, P.text3), [])
+    if (!list.length) lines.push(...wrap('No picks yet. /ledger ideas in a session pulls Hacker News, the feeds and GitHub, and judges them.', w, P.text3))
+    list.forEach((p, i) => {
+      const selected = isSel('ideas', i)
+      const [label, t] = IDEA_BUCKET[p.buckets?.[0]] ?? ['Idea', 'muted']
+      lines.push({ sel: selected, line: [seg(selected ? '› ' : '  ', P.active), seg(`${String(i + 1).padStart(2)} `, P.text3), chip(label, t), seg(` ${p.score}/10`, P.text3), ...(p.kept ? [seg(' kept', P.done)] : []), ...(p.tried ? [seg(' building', P.active)] : []), seg(`  ${p.via}${p.points ? ` · ${p.points} pts` : ''}`, P.text3)] })
+      for (const row of wrapText(p.title, w - 5).slice(0, 2)) lines.push({ sel: selected, line: [seg('     '), seg(row, P.text)] })
+      for (const row of wrapText(p.why || '', w - 5).slice(0, 2)) lines.push({ sel: selected, line: [seg('     '), seg(row, P.text2)] })
+    })
+    return lines
+  }
   if (middle === 'activity') {
     const evs = shownEvents()
     const r = forReq()
@@ -522,6 +553,19 @@ function detailLines(w) {
     return lines
   }
   if (focus === 'middle' && middle === 'project') return [...lines, ...projectDetail(w)]
+  if (focus === 'middle' && middle === 'ideas') {
+    const p = ideas()[sel.ideas]
+    if (!p) return lines
+    lines.push(...wrap(p.title, w, P.text), [seg(`${p.via}${p.by ? ` · ${p.by}` : ''}${p.at ? ` · ${String(p.at).slice(0, 10)}` : ''}`, P.text3)], [])
+    lines.push([seg('Why it matters to you', P.text3)], ...wrap(p.why || '—', w, P.text2, '  '), [])
+    lines.push([seg('Buckets', P.text3)], [seg('  '), ...(p.buckets ?? []).flatMap(b => [chip(...(IDEA_BUCKET[b] ?? [b, 'muted'])), seg(' ')]), ...(p.project ? [seg(` for ${p.project}`, P.text2)] : [])], [])
+    if (p.summary) lines.push(...wrap(p.summary, w, P.text3), [])
+    lines.push(...wrap(p.url, w, P.active))
+    if (p.hn && p.hn !== p.url) lines.push(...wrap(p.hn, w, P.text3))
+    if (p.built) lines.push([], ...wrap(`A V1 build was asked for at ${hhmm(p.built.at)}.`, w, P.done))
+    lines.push([], [key('enter'), seg(' open  ', P.text3), key('k'), seg(' keep  ', P.text3), key('t'), seg(' tried  ', P.text3), key('x'), seg(' drop  ', P.text3), key('b'), seg(' build a V1 in a new session (asks the live agent)', P.text3)])
+    return lines
+  }
   if (focus === 'middle' && middle === 'footprint') {
     const x = footList()[sel.footprint]
     if (!x) return lines
@@ -681,6 +725,8 @@ function projectRows() {
   push(`WAITING ON YOU  ${gate.onYou.length}`, gate.onYou, s => ({ sig: s, st: states.find(st => (st.signals ?? []).includes(s)) }))
   push(`DONE, NOT VERIFIED  ${gate.unverified.length}`, gate.unverified, r => ({ r, st: items.find(x => x.r === r)?.st }))
   push(`CAN SHIP LATER  ${gate.later.length}`, gate.later, r => ({ r, st: items.find(x => x.r === r)?.st }))
+  const toTell = items.map(x => x.r).filter(r => r.tell && r.tell.status !== 'published')
+  push(`TO TELL PEOPLE ABOUT  ${toTell.length}`, toTell, r => ({ r, st: items.find(x => x.r === r)?.st, tell: true }))
   rows.push({ section: `LAST SHIPPED`, text: ship ? `${hhmm(ship.at)} ${ship.command}` : 'nothing recorded yet (a passing git push, gh release, deploy or publish counts)' })
   return { rows, items, gate, states }
 }
@@ -695,7 +741,7 @@ function projectLines(w, isSel) {
     if (row.r) {
       const [label, t] = row.r.needsReverify ? ['Re-verify', 'warn'] : STATUS[row.r.status]
       wrapText(row.r.title, w - 4).slice(0, 2).forEach((line, j) => lines.push({ sel: selected, line: [seg(j ? '    ' : selected ? '› ' : '  ', P.active), seg(j ? '' : `${row.r.id} `, P.text3), seg(line, P.text)] }))
-      lines.push({ sel: selected, line: [seg('    '), seg(label, tone(t)), seg(row.st ? `  ${nameOf(row.st).slice(0, Math.max(8, w - label.length - 8))}` : '', P.text3)] })
+      lines.push({ sel: selected, line: [seg('    '), seg(row.tell ? (row.r.tell.status === 'drafted' ? `outreach drafted${row.r.tell.path && row.r.tell.path !== '(asked)' ? ` · ${path.basename(row.r.tell.path)}` : ''}` : 'no outreach yet') : label, tone(row.tell ? (row.r.tell.status === 'drafted' ? 'done' : 'warn') : t)), seg(row.st ? `  ${nameOf(row.st).slice(0, Math.max(8, w - label.length - 8))}` : '', P.text3)] })
     } else if (row.sig) {
       const [label, t] = SIGNAL[row.sig.kind] ?? ['Signal', 'muted']
       lines.push({ sel: selected, line: [seg(selected ? '› ' : '  ', P.active), chip(label, t), seg(row.st ? `  ${nameOf(row.st).slice(0, Math.max(8, w - 14))}` : '', P.text3)] })
@@ -703,7 +749,7 @@ function projectLines(w, isSel) {
     }
     i++
   }
-  lines.push([], ...wrap('/ledger ship R12 first|later moves a requirement between the two lists; /ledger brief writes this as a file to start a new session from.', w, P.text3))
+  lines.push([], ...wrap('/ledger ship R12 first|later moves a requirement between the lists; /ledger brief writes this as a file to start a new session from; /ledger cmo gives a CMO\'s read of the project.', w, P.text3))
   return lines
 }
 function projectDetail(w) {
@@ -728,7 +774,7 @@ function helpLines(w) {
   const rows = [
     ['tab / ← →', 'move between columns'], ['↑ ↓ or j k', 'move in a list'], ['[ ]', 'previous / next session'], ['S', 'fold the sessions column'],
     ['1 2 3 4', 'activity · plan · tests · preview (opens the middle column)'], ['6 7', 'files this session created · findings'], ['M', 'footprint: memory, files, Principia\'s own spend'], ['P', 'the project: every session, what stops it shipping'],
-    ['0', 'fold the middle column'], ['5', 'show / fold needs-you'], ['/', 'search requirements'], ['F', 'cycle the requirements filter'],
+    ['I G', 'ideas judged for you · the gallery with pictures'], ['0', 'fold the middle column'], ['5', 'show / fold needs-you'], ['/', 'search requirements'], ['F', 'cycle the requirements filter'],
     ['a d x', 'accept as verified · defer · resolve or dismiss'], ['f', 'refine the selected requirement'], ['c i n', 'comment on activity · redirect the agent · new requirement'], ['g', 'ask the agent to close the gaps'],
     ['o t', 'open a diff in your editor · in the terminal'], ['A v', 'all activity · everything, not only key events'], ['C', 'show / hide the completion audit'], ['l h', 'light or dark · headless sessions'], ['?', 'close this help'], ['q', 'quit'],
   ]
@@ -773,7 +819,7 @@ function render() {
       ...(compose.mode === 'comment' ? [] : [seg('  '), compose.interrupt ? chip('interrupt first', 'danger') : seg('ctrl-t interrupt first', P.text3)]),
       seg('  › ', P.active), seg(compose.text + '▏', P.text)]
   } else {
-    footer = [seg(flash || `? keys · tab column · [ ] session · 1-4 6 7 M P middle${prefs.showMiddle ? ' (0 folds it)' : ''} · 5 needs you${needs ? ` (${needs})` : ''} · q quit`, flash ? P.active : P.text3)]
+    footer = [seg(flash || `? keys · tab column · [ ] session · 1-4 6 7 M P I middle${prefs.showMiddle ? ' (0 folds it)' : ''} · 5 needs you${needs ? ` (${needs})` : ''} · q quit`, flash ? P.active : P.text3)]
   }
   rows.push({ line: [] }, { line: [seg('─'.repeat(W), P.border)] }, { line: footer })
   out.write('\x1b[H' + rows.map(r => r.raw ?? paint(r.line, W, P.bg)).join('\r\n') + '\x1b[0m')
@@ -810,7 +856,7 @@ function switchSession(step) {
 
 function clampSel() {
   const max = { reqs: shownReqs().length, signals: openSignals().length, activity: shownEvents().length, plan: S.plan?.length ?? 0, tests: testRuns().length, preview: previews().length, footprint: sessionList().length,
-    files: sessionFiles().length, findings: findings().length, project: projectRows().rows.filter(x => !x.section).length }
+    files: sessionFiles().length, findings: findings().length, project: projectRows().rows.filter(x => !x.section).length, ideas: ideas().length }
   for (const k of Object.keys(sel)) sel[k] = Math.max(0, Math.min(sel[k], (max[k] ?? 1) - 1))
 }
 
@@ -921,6 +967,8 @@ function onKey(k) {
     case '6': middle = 'files'; openMiddle(); break
     case '7': middle = 'findings'; openMiddle(); break
     case 'P': middle = 'project'; openMiddle(); break
+    case 'I': middle = 'ideas'; openMiddle(); break
+    case 'G': { const page = path.join(dir, 'ideas', 'gallery.html'); if (fs.existsSync(page)) return openUrl(page); return say('No gallery yet: /ledger ideas in a session builds it') }
     case '0': prefs.showMiddle = false; savePrefs(); if (focus === 'middle') focus = 'reqs'; break
     case '5': prefs.showNeedsYou = !prefs.showNeedsYou; savePrefs(); focus = prefs.showNeedsYou ? 'signals' : 'reqs'; break
     case '?': help = !help; break
@@ -934,9 +982,16 @@ function onKey(k) {
     case '/': focus = 'reqs'; compose = { mode: 'search', text: search }; break
     case 'F': { const i = REQ_FILTERS.findIndex(f => f.value === reqFilter); reqFilter = REQ_FILTERS[(i + 1) % REQ_FILTERS.length].value; sel.reqs = 0; break }
     case 'g': return send({ type: 'gaps' }, 'Asked the agent to close the gaps')
+    case 'k': if (focus === 'middle' && middle === 'ideas' && ideas()[sel.ideas]) { markIdea(ideas()[sel.ideas].url, { kept: true }); return say('Kept') } break
+    case 'b': if (focus === 'middle' && middle === 'ideas' && ideas()[sel.ideas]) { const p = ideas()[sel.ideas]; return send({ type: 'build', url: p.url, title: p.title, why: p.why }, 'Asked the live agent to start a V1 build in a new session') } break
     case 'a': if (focus === 'reqs' && req) return send({ type: 'accept', reqId: req.id }, `${req.id} accepted as verified`); break
     case 'd': if (focus === 'reqs' && req) return send({ type: 'defer', reqId: req.id }, `${req.id} deferred`); break
+    case 't':
+      if (focus === 'middle' && middle === 'ideas' && ideas()[sel.ideas]) { markIdea(ideas()[sel.ideas].url, { tried: true }); return say('Marked tried') }
+      if (ev?.kind === 'code' && ev.file) return openDiff(ev, true)
+      break
     case 'x':
+      if (focus === 'middle' && middle === 'ideas' && ideas()[sel.ideas]) { markIdea(ideas()[sel.ideas].url, { dropped: true }); clampSel(); return say('Dropped') }
       if (focus === 'reqs' && req?.conflict) return send({ type: 'resolve', reqId: req.id }, `${req.id} conflict marked resolved`)
       if (sig) return send({ type: 'dismiss', signalId: sig.id }, 'Signal dismissed')
       break
@@ -944,6 +999,7 @@ function onKey(k) {
     case '\r':
       if (sig && sig.eventId && S.events.some(e => e.id === sig.eventId)) { middle = 'activity'; showAll = true; allActivity = true; focus = 'middle'; sel.activity = shownEvents().findIndex(e => e.id === sig.eventId); break }
       if (focus === 'middle' && middle === 'preview' && previews()[sel.preview]) return openUrl(previews()[sel.preview].url)
+      if (focus === 'middle' && middle === 'ideas' && ideas()[sel.ideas]) return openUrl(ideas()[sel.ideas].url)
       if (ev && canSend()) compose = { mode: 'comment', text: '', interrupt: false, eventId: ev.id }
       break
     case 'c': if (ev && canSend()) compose = { mode: 'comment', text: '', interrupt: false, eventId: ev.id }; break
@@ -953,7 +1009,6 @@ function onKey(k) {
       break
     case 'i': if (canSend()) compose = { mode: 'redirect', text: '', interrupt: false, eventId: ev?.id }; break
     case 'o': if (ev?.kind === 'code' && ev.file) return openDiff(ev, false); break
-    case 't': if (ev?.kind === 'code' && ev.file) return openDiff(ev, true); break
   }
   render()
 }
